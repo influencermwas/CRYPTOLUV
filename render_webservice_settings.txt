@@ -1,0 +1,20 @@
+Render Web Service settings
+
+Build Command:
+pip install -r requirements.txt
+
+Start Command:
+gunicorn app:app
+
+Environment Variables:
+BOT_TOKEN=your_telegram_bot_token
+ADMIN_ID=your_telegram_user_id
+PUBLIC_URL=https://your-render-service-name.onrender.com
+TWELVEDATA_API_KEY=optional_for_forex_and_stocks
+CRON_SECRET=make_any_secret_word
+
+After deploy, open this once in browser:
+https://your-render-service-name.onrender.com/set_webhook
+
+For auto news checking, use UptimeRobot or cron-job.org to open this URL every 5 minutes:
+https://your-render-service-name.onrender.com/check_news?secret=make_any_secret_word

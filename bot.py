@@ -78,6 +78,9 @@ FREE_CONFIDENCE_LIMIT = int(os.getenv("FREE_CONFIDENCE_LIMIT", "80") or 80)
 PREMIUM_MIN_CONFIDENCE = int(os.getenv("PREMIUM_MIN_CONFIDENCE", "80") or 80)
 PREMIUM_DAILY_LIMIT = int(os.getenv("PREMIUM_DAILY_LIMIT", "5") or 5)
 
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@influencertechgc").strip()
+DATA_BOT_URL = os.getenv("DATA_BOT_URL", "https://t.me/INFLUENCERTECHHUB_BOT?start=5352491388").strip()
+
 CRYPTO_WATCHLIST = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
     "DOGEUSDT", "WLDUSDT", "CELOUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT",
@@ -141,6 +144,47 @@ def activate_premium(user_id: int, hours=24):
     return expires_dt
 
 
+
+def gate_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Start Data Bot", url=DATA_BOT_URL)],
+        [InlineKeyboardButton("📢 Join Main Channel", url="https://t.me/influencertechgc")],
+        [InlineKeyboardButton("✅ I Have Done It", callback_data="verify_access")],
+    ])
+
+
+async def has_required_access(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Telegram can verify channel membership.
+    Telegram cannot verify that a user started another bot unless both bots share a database.
+    So this gate shows the data bot link and verifies the channel.
+    """
+    if not REQUIRED_CHANNEL:
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception as e:
+        logger.warning("Access check failed for %s: %s", user_id, e)
+        return False
+
+
+async def send_access_gate(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🔒 *Access Locked*\n\n"
+            "Before using INFLUENCERTECH SIGNALS, complete these steps:\n\n"
+            "1️⃣ Start our data bot\n"
+            "2️⃣ Join our main channel\n\n"
+            "After that, tap ✅ *I Have Done It*."
+        ),
+        parse_mode="Markdown",
+        reply_markup=gate_keyboard(),
+    )
+
+
 def main_menu():
     keyboard = [
         [
@@ -162,6 +206,11 @@ def main_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
+
+    if not await has_required_access(update.effective_user.id, context):
+        await send_access_gate(update.effective_chat.id, context)
+        return
+
     active, expires = is_premium(update.effective_user.id)
     premium_text = f"✅ Premium active until `{expires.strftime('%Y-%m-%d %H:%M UTC')}`" if active else "🔒 Premium locked"
 
@@ -182,6 +231,21 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     register_user(query.from_user.id)
     data = query.data
+
+    if data == "verify_access":
+        if await has_required_access(query.from_user.id, context):
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="✅ Access verified. Welcome to INFLUENCERTECH SIGNALS.",
+                reply_markup=main_menu(),
+            )
+        else:
+            await send_access_gate(query.message.chat_id, context)
+        return
+
+    if not await has_required_access(query.from_user.id, context):
+        await send_access_gate(query.message.chat_id, context)
+        return
 
     if data.startswith("quick_"):
         symbol = data.replace("quick_", "")
@@ -748,8 +812,11 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
             f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
             f"Pair: *{symbol.upper()}*\n"
             f"Rating: *{rating}*\n"
-            f"Confidence: *{confidence}%*\n\n"
-            "This high-confidence setup is reserved for premium users.\n\n"
+            f"Confidence: *{confidence}%*\n"
+            f"Direction Bias: *{direction}*\n"
+            f"Current Price: `{close:.6g}`\n"
+            f"Risk: *{risk}*\n\n"
+            "A high-confidence setup was found, so full entry, stop loss, take profits, CHoCH/BOS, FVG and order block are locked for premium.\n\n"
             f"💎 Subscribe for *KSh {PREMIUM_PRICE}* to unlock VIP signals for 24 hours.\n"
             "Tap /start then choose 💎 Premium Signals."
         )
@@ -890,6 +957,9 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
 
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
+    if not await has_required_access(update.effective_user.id, context):
+        await send_access_gate(update.effective_chat.id, context)
+        return
     await premium_signals(update.effective_chat.id, update.effective_user.id, context)
 
 
@@ -907,6 +977,10 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
+
+    if not await has_required_access(update.effective_user.id, context):
+        await send_access_gate(update.effective_chat.id, context)
+        return
 
     if not context.args:
         await update.message.reply_text("Use: /analyze BTCUSDT\nOr just send BTCUSDT")
@@ -929,6 +1003,10 @@ async def premium_signal(chat_id: int, user_id: int, context: ContextTypes.DEFAU
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     text = update.message.text.strip()
+
+    if not await has_required_access(update.effective_user.id, context):
+        await send_access_gate(update.effective_chat.id, context)
+        return
 
     if context.user_data.get("awaiting_premium_phone"):
         await handle_premium_phone(update, context)
@@ -999,6 +1077,9 @@ def format_news_alert(item):
 
 async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
+    if not await has_required_access(update.effective_user.id, context):
+        await send_access_gate(update.effective_chat.id, context)
+        return
     await send_news_to_chat(update.effective_chat.id, context)
 
 

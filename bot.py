@@ -74,6 +74,26 @@ NEWS_FEEDS = [
     "https://news.google.com/rss/search?q=stocks+nasdaq+sp500+earnings+inflation+fed&hl=en-US&gl=US&ceid=US:en",
 ]
 
+FREE_CONFIDENCE_LIMIT = int(os.getenv("FREE_CONFIDENCE_LIMIT", "80") or 80)
+PREMIUM_MIN_CONFIDENCE = int(os.getenv("PREMIUM_MIN_CONFIDENCE", "80") or 80)
+PREMIUM_DAILY_LIMIT = int(os.getenv("PREMIUM_DAILY_LIMIT", "5") or 5)
+
+CRYPTO_WATCHLIST = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
+    "DOGEUSDT", "WLDUSDT", "CELOUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT",
+    "DOTUSDT", "NEARUSDT", "OPUSDT", "ARBUSDT", "APTUSDT", "INJUSDT",
+    "SUIUSDT", "TRXUSDT", "LTCUSDT", "BCHUSDT", "PEPEUSDT", "SHIBUSDT",
+]
+
+FOREX_WATCHLIST = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "NZD/USD",
+    "USD/CHF", "GBP/JPY", "EUR/JPY", "XAU/USD",
+]
+
+STOCK_WATCHLIST = [
+    "AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "AMD", "NFLX",
+]
+
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -169,7 +189,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "premium":
         await show_premium(query.message.chat_id, query.from_user.id, context)
     elif data == "vip_signal":
-        await premium_signal(query.message.chat_id, query.from_user.id, context)
+        await premium_signals(query.message.chat_id, query.from_user.id, context)
     elif data == "pay_premium":
         context.user_data["awaiting_premium_phone"] = True
         await context.bot.send_message(
@@ -199,13 +219,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
     if active:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Get VIP Signal", callback_data="vip_signal")]])
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Get 5 VIP Signals", callback_data="vip_signal")]])
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
                 "✅ *Premium Active*\n\n"
                 f"Expires: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
-                "Tap below to receive VIP signal."
+                "Tap below to receive today's VIP signals."
             ),
             parse_mode="Markdown",
             reply_markup=keyboard,
@@ -577,7 +597,7 @@ def detect_order_block(df: pd.DataFrame):
     return "No clear order block"
 
 
-def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False):
+def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_free=True, return_meta=False):
     df = add_indicators(df)
     last = df.iloc[-1]
 
@@ -713,6 +733,27 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False):
 
     vip_header = "💎 *VIP PREMIUM SIGNAL*\n" if vip else ""
 
+    if return_meta:
+        return {
+            "symbol": symbol.upper(),
+            "confidence": confidence,
+            "rating": rating,
+            "direction": direction,
+            "risk": risk,
+        }
+
+    if lock_free and not vip and confidence >= FREE_CONFIDENCE_LIMIT:
+        return (
+            f"🔒 *Premium Signal Detected*\n"
+            f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+            f"Pair: *{symbol.upper()}*\n"
+            f"Rating: *{rating}*\n"
+            f"Confidence: *{confidence}%*\n\n"
+            "This high-confidence setup is reserved for premium users.\n\n"
+            f"💎 Subscribe for *KSh {PREMIUM_PRICE}* to unlock VIP signals for 24 hours.\n"
+            "Tap /start then choose 💎 Premium Signals."
+        )
+
     extra_vip = ""
     if vip:
         extra_vip = (
@@ -758,7 +799,98 @@ async def build_crypto_signal(symbol: str, vip=False):
             mtf[tf_label] = simple_trend(tf_df)
         except Exception:
             mtf[tf_label] = "Unavailable"
-    return generate_signal(df, symbol, mtf=mtf, vip=vip)
+    return generate_signal(df, symbol, mtf=mtf, vip=vip, lock_free=not vip)
+
+
+
+async def score_symbol(symbol: str, asset_type="crypto"):
+    if asset_type == "crypto":
+        df = fetch_crypto_klines(symbol, "15", 150)
+        mtf = {}
+        for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+            try:
+                tf_df = fetch_crypto_klines(symbol, interval, 150)
+                mtf[tf_label] = simple_trend(tf_df)
+            except Exception:
+                mtf[tf_label] = "Unavailable"
+        return generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
+
+    df = fetch_twelvedata(symbol, asset_type)
+    return generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
+
+
+async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    active, expires = is_premium(user_id)
+    if not active:
+        await show_premium(chat_id, user_id, context)
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="🔎 Scanning crypto, forex and stocks for premium setups..."
+    )
+
+    candidates = []
+
+    for symbol in CRYPTO_WATCHLIST:
+        try:
+            meta = await score_symbol(symbol, "crypto")
+            if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE:
+                meta["asset_type"] = "crypto"
+                candidates.append(meta)
+        except Exception as e:
+            logger.warning("Crypto scan failed for %s: %s", symbol, e)
+
+    if TWELVEDATA_API_KEY:
+        for symbol in FOREX_WATCHLIST:
+            try:
+                meta = await score_symbol(symbol, "forex")
+                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE:
+                    meta["asset_type"] = "forex"
+                    candidates.append(meta)
+            except Exception as e:
+                logger.warning("Forex scan failed for %s: %s", symbol, e)
+
+        for symbol in STOCK_WATCHLIST:
+            try:
+                meta = await score_symbol(symbol, "stock")
+                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE:
+                    meta["asset_type"] = "stock"
+                    candidates.append(meta)
+            except Exception as e:
+                logger.warning("Stock scan failed for %s: %s", symbol, e)
+
+    candidates = sorted(candidates, key=lambda x: x["confidence"], reverse=True)[:PREMIUM_DAILY_LIMIT]
+
+    if not candidates:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "💎 *VIP Scan Complete*\\n\\n"
+                "No A-grade premium setup found right now.\\n"
+                "This is good risk control — we do not force weak trades.\\n\\n"
+                "Try again later."
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"💎 Found *{len(candidates)}* premium setup(s). Sending now...",
+        parse_mode="Markdown",
+    )
+
+    for item in candidates:
+        try:
+            await send_analysis(chat_id, user_id, context, item["symbol"], item["asset_type"], premium=True)
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to send {item['symbol']}: {e}")
+
+
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    await premium_signals(update.effective_chat.id, update.effective_user.id, context)
 
 
 async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, symbol: str, asset_type="crypto", premium=False):
@@ -766,7 +898,7 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
         signal = await build_crypto_signal(symbol, vip=premium)
     elif asset_type in ["forex", "stock"]:
         df = fetch_twelvedata(symbol, asset_type)
-        signal = generate_signal(df, symbol, mtf=None, vip=premium)
+        signal = generate_signal(df, symbol, mtf=None, vip=premium, lock_free=not premium)
     else:
         raise ValueError("Asset type must be crypto, forex, or stock.")
 
@@ -791,15 +923,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def premium_signal(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    active, expires = is_premium(user_id)
-    if not active:
-        await show_premium(chat_id, user_id, context)
-        return
-
-    try:
-        await send_analysis(chat_id, user_id, context, "BTCUSDT", "crypto", premium=True)
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Could not generate VIP signal: {e}")
+    await premium_signals(chat_id, user_id, context)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -938,6 +1062,7 @@ def main():
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("premium", premium_command))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 

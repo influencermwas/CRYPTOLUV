@@ -24,6 +24,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 NEWS_CHECK_MINUTES = int(os.getenv("NEWS_CHECK_MINUTES", "5") or 5)
 
 PREMIUM_PRICE = int(os.getenv("PREMIUM_PRICE", "35") or 35)
@@ -524,32 +525,95 @@ def fetch_binance_klines(symbol="BTCUSDT", interval="15", limit=150):
     return fetch_crypto_klines(symbol, interval, limit)
 
 
-def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=150):
-    if not TWELVEDATA_API_KEY:
-        raise ValueError("Twelve Data API key is missing. Add TWELVEDATA_API_KEY in Render Environment Variables.")
+def finnhub_symbol(symbol: str, asset_type: str):
+    clean = symbol.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
 
-    url = "https://api.twelvedata.com/time_series"
+    forex_map = {
+        "EURUSD": "OANDA:EUR_USD",
+        "GBPUSD": "OANDA:GBP_USD",
+        "USDJPY": "OANDA:USD_JPY",
+        "USDCAD": "OANDA:USD_CAD",
+        "AUDUSD": "OANDA:AUD_USD",
+        "NZDUSD": "OANDA:NZD_USD",
+        "USDCHF": "OANDA:USD_CHF",
+        "GBPJPY": "OANDA:GBP_JPY",
+        "EURJPY": "OANDA:EUR_JPY",
+        "XAUUSD": "OANDA:XAU_USD",
+        "XAGUSD": "OANDA:XAG_USD",
+    }
+
+    if asset_type == "forex":
+        return forex_map.get(clean, f"OANDA:{clean[:3]}_{clean[3:]}")
+
+    return clean
+
+
+def finnhub_resolution(interval="15"):
+    interval = str(interval).lower()
+    if interval in ["1", "3", "5", "15", "30", "60"]:
+        return interval
+    if interval in ["1h", "h"]:
+        return "60"
+    if interval in ["1d", "d", "day"]:
+        return "D"
+    return "15"
+
+
+def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=150):
+    """
+    Kept this function name so old bot code does not break.
+    It now uses Finnhub for forex and stocks.
+    """
+    if not FINNHUB_API_KEY:
+        raise ValueError("FINNHUB_API_KEY is missing. Add it in Render Environment Variables.")
+
+    resolution = "15"
+    if "60" in str(interval) or "1h" in str(interval).lower():
+        resolution = "60"
+    elif "1d" in str(interval).lower() or str(interval).lower() == "d":
+        resolution = "D"
+
+    fin_symbol = finnhub_symbol(symbol, asset_type)
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    # 15m candles need enough history for EMA200, so use 7 days
+    from_ts = now_ts - (60 * 60 * 24 * 7)
+
+    if resolution == "D":
+        from_ts = now_ts - (60 * 60 * 24 * 365)
+
+    url = "https://finnhub.io/api/v1/stock/candle"
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY,
+        "symbol": fin_symbol,
+        "resolution": resolution,
+        "from": from_ts,
+        "to": now_ts,
+        "token": FINNHUB_API_KEY,
     }
 
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
 
-    if "values" not in data:
-        raise ValueError(str(data))
+    if data.get("s") != "ok":
+        raise ValueError(f"Finnhub returned no data for {symbol} ({fin_symbol}): {data}")
 
-    df = pd.DataFrame(data["values"])
-    df = df.iloc[::-1].reset_index(drop=True)
+    df = pd.DataFrame({
+        "open": data["o"],
+        "high": data["h"],
+        "low": data["l"],
+        "close": data["c"],
+        "volume": data.get("v", [0] * len(data["c"])),
+    })
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+    df = df.dropna().tail(outputsize).reset_index(drop=True)
+
+    if len(df) < 50:
+        raise ValueError(f"Not enough Finnhub candle data for {symbol}")
+
     return df
 
 
@@ -923,7 +987,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         except Exception as e:
             logger.warning("Crypto scan failed for %s: %s", symbol, e)
 
-    if TWELVEDATA_API_KEY:
+    if FINNHUB_API_KEY:
         for symbol in FOREX_WATCHLIST:
             try:
                 meta = await score_symbol(symbol, "forex")
@@ -1027,22 +1091,33 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_premium_phone(update, context)
         return
 
-    clean = text.upper().replace("/", "").replace("-", "").replace(" ", "")
-    known_suffixes = ["USDT", "USD"]
-    looks_like_symbol = clean.isalnum() and (clean.endswith(tuple(known_suffixes)) or clean in ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"])
+    clean = text.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
 
-    if clean in ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"]:
+    crypto_shortcuts = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "WLD", "CELO", "AVAX", "LINK"]
+    forex_symbols = ["EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCHF", "GBPJPY", "EURJPY", "XAUUSD", "XAGUSD"]
+    stock_symbols = ["AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "AMD", "NFLX"]
+
+    if clean in crypto_shortcuts:
         clean = clean + "USDT"
 
-    if looks_like_symbol:
-        try:
+    try:
+        if clean.endswith("USDT"):
             await send_analysis(update.effective_chat.id, update.effective_user.id, context, clean, "crypto", premium=False)
             return
-        except Exception as e:
-            await update.message.reply_text(f"❌ Could not analyze {clean}. Error: {e}")
+
+        if clean in forex_symbols:
+            await send_analysis(update.effective_chat.id, update.effective_user.id, context, clean, "forex", premium=False)
             return
 
-    await update.message.reply_text("Send a symbol like BTCUSDT or tap /start for menu.")
+        if clean in stock_symbols or (clean.isalpha() and 1 <= len(clean) <= 5):
+            await send_analysis(update.effective_chat.id, update.effective_user.id, context, clean, "stock", premium=False)
+            return
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not analyze {clean}. Error: {e}")
+        return
+
+    await update.message.reply_text("Send a symbol like BTCUSDT, EURUSD, XAUUSD, AAPL or tap /start for menu.")
 
 
 def scan_news():

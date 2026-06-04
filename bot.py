@@ -92,10 +92,12 @@ def main_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
-
     text = (
-        "🤖 *Market Signal Bot*\n\n"
-        "I analyze crypto, forex and stocks using technical indicators and market news.\n\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+        "I analyze crypto, forex and stocks using technical indicators, news risk and SMC-style tools.\n\n"
+        "Analysis includes:\n"
+        "EMA, RSI, MACD, Volume, Support/Resistance, Multi-Timeframe Trend,\n"
+        "Liquidity Sweeps, Order Blocks, CHoCH, BOS and FVG.\n\n"
         "Example commands:\n"
         "`/analyze BTCUSDT`\n"
         "`/analyze ETHUSDT`\n"
@@ -104,7 +106,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/analyze AAPL stock`\n\n"
         "⚠️ Signals are not guaranteed. Always use stop loss."
     )
-
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
 
 
@@ -112,7 +113,6 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     register_user(query.from_user.id)
-
     data = query.data
 
     if data == "crypto_help":
@@ -138,32 +138,39 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1. Never risk more than 1-2% per trade.\n"
             "2. Avoid trading during high-impact news.\n"
             "3. Always use stop loss.\n"
-            "4. Wait for confirmation before entry.",
+            "4. Wait for confirmation before entry.\n"
+            "5. Do not enter blindly just because the bot says BUY/SELL.",
             reply_markup=main_menu(),
         )
 
 
-def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
+def to_okx_symbol(symbol: str):
     symbol = symbol.upper().replace("/", "").replace("-", "")
-
     if symbol.endswith("USDT"):
         base = symbol.replace("USDT", "")
-        inst_id = f"{base}-USDT"
-    elif symbol.endswith("USD"):
+        return f"{base}-USDT"
+    if symbol.endswith("USD"):
         base = symbol.replace("USD", "")
-        inst_id = f"{base}-USD"
-    else:
-        inst_id = symbol
+        return f"{base}-USD"
+    return symbol
 
-    bar = "15m"
-    if str(interval) in ["1", "3", "5", "15", "30"]:
-        bar = f"{interval}m"
-    elif str(interval) in ["60", "1h"]:
-        bar = "1H"
-    elif str(interval) in ["240", "4h"]:
-        bar = "4H"
-    elif str(interval) in ["1d", "D"]:
-        bar = "1D"
+
+def interval_to_okx_bar(interval):
+    interval = str(interval).lower()
+    if interval in ["1", "3", "5", "15", "30"]:
+        return f"{interval}m"
+    if interval in ["60", "1h"]:
+        return "1H"
+    if interval in ["240", "4h"]:
+        return "4H"
+    if interval in ["1d", "d"]:
+        return "1D"
+    return "15m"
+
+
+def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
+    inst_id = to_okx_symbol(symbol)
+    bar = interval_to_okx_bar(interval)
 
     url = "https://www.okx.com/api/v5/market/candles"
     params = {"instId": inst_id, "bar": bar, "limit": str(limit)}
@@ -193,11 +200,9 @@ def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
     df = pd.DataFrame(rows)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
-
     return df
 
 
-# Kept old name so app.py/older code does not break
 def fetch_binance_klines(symbol="BTCUSDT", interval="15", limit=150):
     return fetch_crypto_klines(symbol, interval, limit)
 
@@ -216,8 +221,8 @@ def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=
 
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-
     data = r.json()
+
     if "values" not in data:
         raise ValueError(str(data))
 
@@ -250,7 +255,96 @@ def add_indicators(df: pd.DataFrame):
     return df
 
 
-def generate_signal(df: pd.DataFrame, symbol: str):
+def simple_trend(df: pd.DataFrame):
+    df = add_indicators(df)
+    last = df.iloc[-1]
+    if last["ema20"] > last["ema50"] and last["close"] > last["ema200"]:
+        return "Bullish"
+    if last["ema20"] < last["ema50"] and last["close"] < last["ema200"]:
+        return "Bearish"
+    return "Mixed"
+
+
+def detect_liquidity_sweep(df: pd.DataFrame):
+    recent = df.tail(25)
+    last = df.iloc[-1]
+    previous_high = recent["high"].iloc[:-1].max()
+    previous_low = recent["low"].iloc[:-1].min()
+
+    if last["high"] > previous_high and last["close"] < previous_high:
+        return "Buy-side liquidity sweep detected"
+    if last["low"] < previous_low and last["close"] > previous_low:
+        return "Sell-side liquidity sweep detected"
+    return "No clear liquidity sweep"
+
+
+def detect_bos_choch(df: pd.DataFrame):
+    recent = df.tail(40).reset_index(drop=True)
+    last_close = recent["close"].iloc[-1]
+
+    prior_high = recent["high"].iloc[-20:-1].max()
+    prior_low = recent["low"].iloc[-20:-1].min()
+    older_high = recent["high"].iloc[-40:-20].max()
+    older_low = recent["low"].iloc[-40:-20].min()
+
+    structure_before = "Bullish" if prior_high > older_high and prior_low > older_low else "Bearish" if prior_high < older_high and prior_low < older_low else "Range"
+
+    if last_close > prior_high:
+        if structure_before == "Bearish":
+            return "Bullish CHoCH detected", "Bullish"
+        return "Bullish BOS detected", "Bullish"
+
+    if last_close < prior_low:
+        if structure_before == "Bullish":
+            return "Bearish CHoCH detected", "Bearish"
+        return "Bearish BOS detected", "Bearish"
+
+    return "No fresh BOS/CHoCH", "Neutral"
+
+
+def detect_fvg(df: pd.DataFrame):
+    recent = df.tail(30).reset_index(drop=True)
+    last_fvg = None
+
+    for i in range(2, len(recent)):
+        c1 = recent.iloc[i - 2]
+        c3 = recent.iloc[i]
+
+        if c3["low"] > c1["high"]:
+            last_fvg = ("Bullish FVG", float(c1["high"]), float(c3["low"]))
+
+        if c3["high"] < c1["low"]:
+            last_fvg = ("Bearish FVG", float(c3["high"]), float(c1["low"]))
+
+    if not last_fvg:
+        return "No clear FVG"
+
+    fvg_type, low_zone, high_zone = last_fvg
+    return f"{fvg_type}: {low_zone:.6g} - {high_zone:.6g}"
+
+
+def detect_order_block(df: pd.DataFrame):
+    recent = df.tail(35).reset_index(drop=True)
+    last_close = recent["close"].iloc[-1]
+    prior_high = recent["high"].iloc[-20:-1].max()
+    prior_low = recent["low"].iloc[-20:-1].min()
+
+    if last_close > prior_high:
+        bearish_candles = recent[(recent["close"] < recent["open"])].tail(3)
+        if not bearish_candles.empty:
+            ob = bearish_candles.iloc[-1]
+            return f"Bullish OB zone: {float(ob['low']):.6g} - {float(ob['high']):.6g}"
+
+    if last_close < prior_low:
+        bullish_candles = recent[(recent["close"] > recent["open"])].tail(3)
+        if not bullish_candles.empty:
+            ob = bullish_candles.iloc[-1]
+            return f"Bearish OB zone: {float(ob['low']):.6g} - {float(ob['high']):.6g}"
+
+    return "No clear order block"
+
+
+def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
     df = add_indicators(df)
     last = df.iloc[-1]
 
@@ -260,6 +354,11 @@ def generate_signal(df: pd.DataFrame, symbol: str):
 
     avg_volume = float(df["volume"].tail(30).mean()) if df["volume"].sum() > 0 else 0
     volume_ok = avg_volume == 0 or float(last["volume"]) >= avg_volume * 0.8
+
+    liquidity = detect_liquidity_sweep(df)
+    structure_text, structure_bias = detect_bos_choch(df)
+    fvg = detect_fvg(df)
+    order_block = detect_order_block(df)
 
     bullish = 0
     bearish = 0
@@ -305,8 +404,49 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         bearish += 1
         reasons.append("Volume is weak")
 
+    if structure_bias == "Bullish":
+        bullish += 2
+        reasons.append(structure_text)
+    elif structure_bias == "Bearish":
+        bearish += 2
+        reasons.append(structure_text)
+    else:
+        reasons.append(structure_text)
+
+    if "Bullish FVG" in fvg:
+        bullish += 1
+        reasons.append(fvg)
+    elif "Bearish FVG" in fvg:
+        bearish += 1
+        reasons.append(fvg)
+    else:
+        reasons.append(fvg)
+
+    if "Sell-side liquidity sweep" in liquidity:
+        bullish += 1
+        reasons.append(liquidity)
+    elif "Buy-side liquidity sweep" in liquidity:
+        bearish += 1
+        reasons.append(liquidity)
+    else:
+        reasons.append(liquidity)
+
+    if mtf:
+        mtf_bullish = sum(1 for x in mtf.values() if x == "Bullish")
+        mtf_bearish = sum(1 for x in mtf.values() if x == "Bearish")
+
+        if mtf_bullish >= 2:
+            bullish += 2
+            reasons.append("Multi-timeframe trend supports bullish setup")
+        elif mtf_bearish >= 2:
+            bearish += 2
+            reasons.append("Multi-timeframe trend supports bearish setup")
+        else:
+            reasons.append("Multi-timeframe trend is mixed")
+
     if bullish > bearish:
         direction = "BUY / LONG"
+        rating = "🟢 STRONG BUY" if bullish - bearish >= 4 else "🟡 BUY"
         entry_low = close * 0.998
         entry_high = close * 1.002
         stop = min(support, close * 0.985)
@@ -314,6 +454,7 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         tp2 = close * 1.030
     elif bearish > bullish:
         direction = "SELL / SHORT"
+        rating = "🔴 STRONG SELL" if bearish - bullish >= 4 else "🟠 SELL"
         entry_low = close * 0.998
         entry_high = close * 1.002
         stop = max(resistance, close * 1.015)
@@ -321,33 +462,45 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         tp2 = close * 0.970
     else:
         direction = "WAIT"
+        rating = "⚪ NEUTRAL"
         entry_low = close
         entry_high = close
         stop = support
         tp1 = resistance
         tp2 = resistance
 
-    confidence = min(90, max(45, 50 + abs(bullish - bearish) * 10))
-    risk = "Low" if confidence >= 75 else "Medium" if confidence >= 60 else "High"
+    confidence = min(92, max(45, 50 + abs(bullish - bearish) * 7))
+    risk = "Low" if confidence >= 78 else "Medium" if confidence >= 62 else "High"
+
+    mtf_text = "Not available"
+    if mtf:
+        mtf_text = " | ".join([f"{tf}: {trend}" for tf, trend in mtf.items()])
 
     return (
-f"📊 *{symbol.upper()} Signal*\n"
-f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
-f"Direction: *{direction}*\n"
-f"Current Price: `{close:.6g}`\n"
-f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
-f"Stop Loss: `{stop:.6g}`\n"
-f"Take Profit 1: `{tp1:.6g}`\n"
-f"Take Profit 2: `{tp2:.6g}`\n\n"
-f"Support: `{support:.6g}`\n"
-f"Resistance: `{resistance:.6g}`\n"
-f"Risk: *{risk}*\n"
-f"Confidence: *{confidence}%*\n\n"
-"Reason:\n- " + "\n- ".join(reasons) +
-"\n\n━━━━━━━━━━━━━━━━━━\n"
-"⚠️ This is analysis only, not guaranteed profit.DYOR"
-)
-
+        f"📊 *{symbol.upper()} Signal*\n"
+        f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+        f"Rating: *{rating}*\n"
+        f"Direction: *{direction}*\n"
+        f"Current Price: `{close:.6g}`\n"
+        f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
+        f"Stop Loss: `{stop:.6g}`\n"
+        f"Take Profit 1: `{tp1:.6g}`\n"
+        f"Take Profit 2: `{tp2:.6g}`\n\n"
+        f"Support: `{support:.6g}`\n"
+        f"Resistance: `{resistance:.6g}`\n"
+        f"Risk: *{risk}*\n"
+        f"Confidence: *{confidence}%*\n\n"
+        f"📌 *SMC Analysis*\n"
+        f"CHoCH/BOS: `{structure_text}`\n"
+        f"FVG: `{fvg}`\n"
+        f"Order Block: `{order_block}`\n"
+        f"Liquidity: `{liquidity}`\n"
+        f"MTF Trend: `{mtf_text}`\n\n"
+        "Reason:\n- " + "\n- ".join(reasons[:12]) +
+        "\n\n━━━━━━━━━━━━━━━━━━\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n"
+        "⚠️ This is analysis only, not guaranteed profit."
+    )
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -368,16 +521,28 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asset_type = context.args[1].lower() if len(context.args) > 1 else "crypto"
 
     try:
+        mtf = None
+
         if asset_type == "crypto":
             df = fetch_crypto_klines(symbol, "15", 150)
+            mtf = {}
+            for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+                try:
+                    tf_df = fetch_crypto_klines(symbol, interval, 150)
+                    mtf[tf_label] = simple_trend(tf_df)
+                except Exception:
+                    mtf[tf_label] = "Unavailable"
+
         elif asset_type in ["forex", "stock"]:
             df = fetch_twelvedata(symbol, asset_type)
+
         else:
             await update.message.reply_text("Asset type must be crypto, forex, or stock.")
             return
 
-        signal = generate_signal(df, symbol)
+        signal = generate_signal(df, symbol, mtf=mtf)
         await update.message.reply_text(signal, parse_mode="Markdown")
+
     except Exception as e:
         logger.exception("Analyze error")
         await update.message.reply_text(f"❌ Could not analyze {symbol}. Error: {e}")
@@ -419,7 +584,8 @@ def scan_news():
 def format_news_alert(item):
     reasons = ", ".join(item["reason"])
     return (
-        "🚨 *MARKET NEWS ALERT*\n\n"
+        "🚨 *MARKET NEWS ALERT*\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
         f"Impact: *High Risk*\n"
         f"Topic: {reasons}\n\n"
         f"Headline: {item['title']}\n\n"
@@ -472,7 +638,11 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = 0
     for user_id in users:
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"📢 *Broadcast*\n\n{message}", parse_mode="Markdown")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📢 *Broadcast*\n🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n{message}",
+                parse_mode="Markdown"
+            )
             sent += 1
         except Exception:
             pass

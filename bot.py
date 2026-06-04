@@ -807,16 +807,31 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         }
 
     if lock_free and not vip and confidence >= FREE_CONFIDENCE_LIMIT:
+        free_confidence = min(79, confidence)
         return (
-            f"🔒 *Premium Signal Detected*\n"
+            f"📊 *{symbol.upper()} Free Scalp Signal*\n"
             f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
-            f"Pair: *{symbol.upper()}*\n"
             f"Rating: *{rating}*\n"
-            f"Confidence: *{confidence}%*\n"
-            f"Direction Bias: *{direction}*\n"
+            f"Direction: *{direction}*\n"
             f"Current Price: `{close:.6g}`\n"
-            f"Risk: *{risk}*\n\n"
-            "A high-confidence setup was found, so full entry, stop loss, take profits, CHoCH/BOS, FVG and order block are locked for premium.\n\n"
+            f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
+            f"Stop Loss: `{stop:.6g}`\n"
+            f"Take Profit 1: `{tp1:.6g}`\n"
+            f"Take Profit 2: `{tp2:.6g}`\n"
+            f"Risk: *{risk}*\n"
+            f"Free Confidence: *{free_confidence}%*\n\n"
+            "📌 *Free Analysis*\n"
+            f"Support: `{support:.6g}`\n"
+            f"Resistance: `{resistance:.6g}`\n"
+            "SMC details are locked for premium.\n\n"
+            "🔒 *Premium Unlocks:*\n"
+            "- Full confidence score\n"
+            "- CHoCH/BOS confirmation\n"
+            "- FVG zone\n"
+            "- Order block\n"
+            "- Liquidity sweep\n"
+            "- Multi-timeframe trend\n"
+            "- TP3 and risk-reward ratio\n\n"
             f"💎 Subscribe for *KSh {PREMIUM_PRICE}* to unlock VIP signals for 24 hours.\n"
             "Tap /start then choose 💎 Premium Signals."
         )

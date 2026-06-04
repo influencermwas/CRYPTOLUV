@@ -81,6 +81,16 @@ def register_user(user_id: int):
 
 def main_menu():
     keyboard = [
+        [
+            InlineKeyboardButton("₿ BTC", callback_data="quick:BTCUSDT"),
+            InlineKeyboardButton("Ξ ETH", callback_data="quick:ETHUSDT"),
+            InlineKeyboardButton("◎ SOL", callback_data="quick:SOLUSDT"),
+        ],
+        [
+            InlineKeyboardButton("XRP", callback_data="quick:XRPUSDT"),
+            InlineKeyboardButton("BNB", callback_data="quick:BNBUSDT"),
+            InlineKeyboardButton("DOGE", callback_data="quick:DOGEUSDT"),
+        ],
         [InlineKeyboardButton("📈 Analyze Crypto", callback_data="crypto_help")],
         [InlineKeyboardButton("📊 Analyze Forex", callback_data="forex_help")],
         [InlineKeyboardButton("🏦 Analyze Stock", callback_data="stock_help")],
@@ -114,6 +124,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     register_user(query.from_user.id)
     data = query.data
+
+    if data.startswith("quick:"):
+        symbol = data.split(":", 1)[1]
+        await query.edit_message_text(f"⏳ Analyzing {symbol}...")
+        await send_analysis_result(query.message.chat_id, symbol, "crypto", context)
+        return
 
     if data == "crypto_help":
         await query.edit_message_text(
@@ -503,6 +519,33 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
     )
 
 
+async def send_analysis_result(chat_id: int, symbol: str, asset_type: str, context: ContextTypes.DEFAULT_TYPE):
+    symbol = symbol.upper().strip()
+    asset_type = asset_type.lower().strip()
+
+    mtf = None
+
+    if asset_type == "crypto":
+        df = fetch_crypto_klines(symbol, "15", 150)
+        mtf = {}
+        for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+            try:
+                tf_df = fetch_crypto_klines(symbol, interval, 150)
+                mtf[tf_label] = simple_trend(tf_df)
+            except Exception:
+                mtf[tf_label] = "Unavailable"
+
+    elif asset_type in ["forex", "stock"]:
+        df = fetch_twelvedata(symbol, asset_type)
+
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="Asset type must be crypto, forex, or stock.")
+        return
+
+    signal = generate_signal(df, symbol, mtf=mtf)
+    await context.bot.send_message(chat_id=chat_id, text=signal, parse_mode="Markdown")
+
+
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
 
@@ -510,39 +553,19 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Use:\n"
             "/analyze BTCUSDT\n"
-            "/analyze ETHUSDT\n"
-            "/analyze SOLUSDT\n"
+            "Or just type:\n"
+            "BTCUSDT\nETHUSDT\nSOLUSDT\n\n"
+            "Forex/stock examples:\n"
             "/analyze EUR/USD forex\n"
             "/analyze AAPL stock"
         )
         return
 
-    symbol = context.args[0].upper()
-    asset_type = context.args[1].lower() if len(context.args) > 1 else "crypto"
+    symbol = context.args[0].upper().strip()
+    asset_type = context.args[1].lower().strip() if len(context.args) > 1 else "crypto"
 
     try:
-        mtf = None
-
-        if asset_type == "crypto":
-            df = fetch_crypto_klines(symbol, "15", 150)
-            mtf = {}
-            for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
-                try:
-                    tf_df = fetch_crypto_klines(symbol, interval, 150)
-                    mtf[tf_label] = simple_trend(tf_df)
-                except Exception:
-                    mtf[tf_label] = "Unavailable"
-
-        elif asset_type in ["forex", "stock"]:
-            df = fetch_twelvedata(symbol, asset_type)
-
-        else:
-            await update.message.reply_text("Asset type must be crypto, forex, or stock.")
-            return
-
-        signal = generate_signal(df, symbol, mtf=mtf)
-        await update.message.reply_text(signal, parse_mode="Markdown")
-
+        await send_analysis_result(update.effective_chat.id, symbol, asset_type, context)
     except Exception as e:
         logger.exception("Analyze error")
         await update.message.reply_text(f"❌ Could not analyze {symbol}. Error: {e}")

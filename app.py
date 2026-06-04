@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import re
 
 import requests
 from dotenv import load_dotenv
@@ -16,7 +15,9 @@ from bot import (
     news_command,
     broadcast,
     button_click,
+    text_handler,
     scheduled_news_check,
+    handle_mpesa_callback,
 )
 
 load_dotenv()
@@ -35,33 +36,7 @@ telegram_app.add_handler(CommandHandler("analyze", analyze))
 telegram_app.add_handler(CommandHandler("news", news_command))
 telegram_app.add_handler(CommandHandler("broadcast", broadcast))
 telegram_app.add_handler(CallbackQueryHandler(button_click))
-
-
-async def text_analysis(update: Update, context):
-    text = (update.message.text or "").strip()
-    if not text or text.startswith("/"):
-        return
-
-    clean = text.upper().replace(" ", "").replace("-", "").replace("/", "")
-
-    greetings = {"HI", "HELLO", "HEY", "MENU", "START"}
-    if clean in greetings:
-        await start(update, context)
-        return
-
-    # Auto-analyze typed symbols like BTCUSDT, ETHUSDT, SOLUSDT.
-    # For forex/stocks users can still use /analyze EUR/USD forex or /analyze AAPL stock.
-    if re.fullmatch(r"[A-Z0-9]{3,15}", clean):
-        context.args = [clean]
-        await analyze(update, context)
-        return
-
-    await update.message.reply_text(
-        "Send a symbol like BTCUSDT, ETHUSDT, SOLUSDT, or use /start for the menu."
-    )
-
-
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_analysis))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -108,8 +83,7 @@ def set_webhook():
 
     return jsonify({
         "webhook": response.json(),
-        "menu": "Telegram command menu added successfully",
-        "auto_analysis": "Users can now type BTCUSDT directly"
+        "menu": "Telegram command menu added successfully"
     })
 
 
@@ -131,4 +105,15 @@ def check_news():
         return jsonify({"ok": True, "message": "News check completed"})
     except Exception as e:
         logger.exception("News check error")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/mpesa_callback")
+def mpesa_callback():
+    try:
+        data = request.get_json(force=True)
+        result = loop.run_until_complete(handle_mpesa_callback(data, telegram_app.bot))
+        return jsonify(result)
+    except Exception as e:
+        logger.exception("M-Pesa callback error")
         return jsonify({"ok": False, "error": str(e)}), 500

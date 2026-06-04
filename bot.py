@@ -42,6 +42,13 @@ NEWS_FILE = "seen_news.json"
 PREMIUM_FILE = "premium_users.json"
 PENDING_FILE = "pending_payments.json"
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")).strip()
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
+
+VIP_HISTORY_TABLE = os.getenv("VIP_HISTORY_TABLE", "signals_vip_history").strip()
+PREMIUM_TABLE = os.getenv("PREMIUM_TABLE", "signals_premium_users").strip()
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -87,15 +94,19 @@ CRYPTO_WATCHLIST = [
     "DOGEUSDT", "WLDUSDT", "CELOUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT",
     "DOTUSDT", "NEARUSDT", "OPUSDT", "ARBUSDT", "APTUSDT", "INJUSDT",
     "SUIUSDT", "TRXUSDT", "LTCUSDT", "BCHUSDT", "PEPEUSDT", "SHIBUSDT",
+    "UNIUSDT", "AAVEUSDT", "FILUSDT", "ETCUSDT", "ATOMUSDT", "FETUSDT",
+    "RENDERUSDT", "ICPUSDT", "MATICUSDT", "SEIUSDT", "JUPUSDT", "TIAUSDT",
 ]
 
 FOREX_WATCHLIST = [
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "NZD/USD",
-    "USD/CHF", "GBP/JPY", "EUR/JPY", "XAU/USD",
+    "USD/CHF", "GBP/JPY", "EUR/JPY", "XAU/USD", "XAG/USD",
+    "EUR/GBP", "EUR/AUD", "AUD/JPY", "CAD/JPY", "CHF/JPY",
 ]
 
 STOCK_WATCHLIST = [
     "AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "AMD", "NFLX",
+    "PLTR", "COIN", "MSTR", "SMCI", "AVGO", "ARM", "BABA", "JPM", "SPY", "QQQ",
 ]
 
 
@@ -116,33 +127,155 @@ def save_json(path, data):
         json.dump(data, f, indent=2)
 
 
+def sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def sb_url(table: str):
+    return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+def sb_get(table: str, params=None):
+    if not USE_SUPABASE:
+        return None
+    try:
+        r = requests.get(sb_url(table), headers=sb_headers(), params=params or {}, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("Supabase GET failed %s: %s", table, e)
+        return None
+
+
+def sb_post(table: str, payload: dict):
+    if not USE_SUPABASE:
+        return None
+    try:
+        r = requests.post(sb_url(table), headers=sb_headers(), json=payload, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("Supabase POST failed %s: %s", table, e)
+        return None
+
+
+def sb_patch(table: str, params: dict, payload: dict):
+    if not USE_SUPABASE:
+        return None
+    try:
+        r = requests.patch(sb_url(table), headers=sb_headers(), params=params, json=payload, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("Supabase PATCH failed %s: %s", table, e)
+        return None
+
+
+def sb_upsert(table: str, payload: dict, conflict="user_id"):
+    if not USE_SUPABASE:
+        return None
+    headers = sb_headers()
+    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    try:
+        r = requests.post(sb_url(table), headers=headers, params={"on_conflict": conflict}, json=payload, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("Supabase UPSERT failed %s: %s", table, e)
+        return None
+
+
 def register_user(user_id: int):
+    """Register user locally. Returns True if first time in local users.json."""
     users = load_json(USERS_FILE, [])
-    if user_id not in users:
+    is_new = user_id not in users
+    if is_new:
         users.append(user_id)
         save_json(USERS_FILE, users)
+    return is_new
+
+
+def get_premium_row(user_id: int):
+    rows = sb_get(PREMIUM_TABLE, {"user_id": f"eq.{user_id}", "select": "*", "limit": "1"})
+    if rows:
+        return rows[0]
+    return None
+
+
+def parse_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def is_premium(user_id: int):
+    if USE_SUPABASE:
+        row = get_premium_row(user_id)
+        expires_dt = parse_dt(row.get("expires_at")) if row else None
+        if expires_dt and expires_dt > now_utc():
+            return True, expires_dt
+        return False, expires_dt
+
     premium = load_json(PREMIUM_FILE, {})
     expires = premium.get(str(user_id))
     if not expires:
         return False, None
-    try:
-        expires_dt = datetime.fromisoformat(expires)
-        if expires_dt > now_utc():
-            return True, expires_dt
-    except Exception:
-        pass
-    return False, None
+    expires_dt = parse_dt(expires)
+    if expires_dt and expires_dt > now_utc():
+        return True, expires_dt
+    return False, expires_dt
 
 
-def activate_premium(user_id: int, hours=24):
-    premium = load_json(PREMIUM_FILE, {})
+def activate_premium(user_id: int, hours=24, source="paid", mark_trial_used=False):
     expires_dt = now_utc() + timedelta(hours=hours)
+
+    if USE_SUPABASE:
+        payload = {
+            "user_id": str(user_id),
+            "expires_at": expires_dt.isoformat(),
+            "source": source,
+            "remind_6h_sent": False,
+            "remind_1h_sent": False,
+            "expired_notice_sent": False,
+            "updated_at": now_utc().isoformat(),
+        }
+        if mark_trial_used:
+            payload["trial_used"] = True
+        sb_upsert(PREMIUM_TABLE, payload)
+
+    premium = load_json(PREMIUM_FILE, {})
     premium[str(user_id)] = expires_dt.isoformat()
     save_json(PREMIUM_FILE, premium)
     return expires_dt
+
+
+def ensure_free_trial(user_id: int):
+    """Give 24h free trial once per user. Returns expiry if trial was created."""
+    if USE_SUPABASE:
+        row = get_premium_row(user_id)
+        if row and row.get("trial_used"):
+            return None
+        active, _ = is_premium(user_id)
+        if active:
+            # Still mark trial used so it cannot be claimed after paid premium expires.
+            sb_upsert(PREMIUM_TABLE, {"user_id": str(user_id), "trial_used": True, "updated_at": now_utc().isoformat()})
+            return None
+        return activate_premium(user_id, 24, source="free_trial", mark_trial_used=True)
+
+    trials = load_json("trial_users.json", [])
+    if user_id in trials:
+        return None
+    trials.append(user_id)
+    save_json("trial_users.json", trials)
+    return activate_premium(user_id, 24, source="free_trial")
 
 
 
@@ -199,6 +332,10 @@ def main_menu():
             InlineKeyboardButton("⚡ DOGE", callback_data="quick_DOGEUSDT"),
         ],
         [InlineKeyboardButton("💎 Premium Signals", callback_data="premium")],
+        [
+            InlineKeyboardButton("📜 VIP History", callback_data="vip_history"),
+            InlineKeyboardButton("📊 VIP Performance", callback_data="vip_performance"),
+        ],
         [InlineKeyboardButton("📰 Market News", callback_data="news")],
         [InlineKeyboardButton("⚠️ Risk Rules", callback_data="risk")],
     ]
@@ -212,8 +349,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_access_gate(update.effective_chat.id, context)
         return
 
+    trial_expires = ensure_free_trial(update.effective_user.id)
     active, expires = is_premium(update.effective_user.id)
-    premium_text = f"✅ Premium active until `{expires.strftime('%Y-%m-%d %H:%M UTC')}`" if active else "🔒 Premium locked"
+    if trial_expires:
+        premium_text = f"🎁 Free 24-hour Premium Trial active until `{trial_expires.strftime('%Y-%m-%d %H:%M UTC')}`"
+    else:
+        premium_text = f"✅ Premium active until `{expires.strftime('%Y-%m-%d %H:%M UTC')}`" if active else "🔒 Premium locked"
 
     text = (
         "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
@@ -235,9 +376,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "verify_access":
         if await has_required_access(query.from_user.id, context):
+            trial_expires = ensure_free_trial(query.from_user.id)
+            trial_text = f"\n🎁 Free 24-hour Premium Trial activated until {trial_expires.strftime('%Y-%m-%d %H:%M UTC')}." if trial_expires else ""
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text="✅ Access verified. Welcome to INFLUENCERTECH SIGNALS.",
+                text="✅ Access verified. Welcome to INFLUENCERTECH SIGNALS." + trial_text,
                 reply_markup=main_menu(),
             )
         else:
@@ -268,6 +411,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             parse_mode="Markdown",
         )
+    elif data == "vip_history":
+        await send_vip_history(query.message.chat_id, query.from_user.id, context)
+    elif data == "vip_performance":
+        await send_vip_performance(query.message.chat_id, query.from_user.id, context)
     elif data == "news":
         await send_news_to_chat(query.message.chat_id, context)
     elif data == "risk":
@@ -284,7 +431,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
     if active:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Get 5 VIP Signals", callback_data="vip_signal")]])
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Get VIP Signals", callback_data="vip_signal")], [InlineKeyboardButton("📜 History", callback_data="vip_history"), InlineKeyboardButton("📊 Performance", callback_data="vip_performance")]])
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -508,6 +655,7 @@ def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
     rows = []
     for c in reversed(candles):
         rows.append({
+            "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc).isoformat(),
             "open": float(c[1]),
             "high": float(c[2]),
             "low": float(c[3]),
@@ -599,6 +747,7 @@ def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=
         raise ValueError(f"Finnhub returned no data for {symbol} ({fin_symbol}): {data}")
 
     df = pd.DataFrame({
+        "time": [datetime.fromtimestamp(t, tz=timezone.utc).isoformat() for t in data.get("t", [])],
         "open": data["o"],
         "high": data["h"],
         "low": data["l"],
@@ -868,6 +1017,16 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
             "rating": rating,
             "direction": direction,
             "risk": risk,
+            "current_price": close,
+            "entry_low": entry_low,
+            "entry_high": entry_high,
+            "stop_loss": stop,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "support": support,
+            "resistance": resistance,
+            "created_at": now_utc().isoformat(),
         }
 
     if lock_free and not vip and confidence >= FREE_CONFIDENCE_LIMIT:
@@ -965,6 +1124,239 @@ async def score_symbol(symbol: str, asset_type="crypto"):
     return generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
 
 
+
+
+def save_vip_signal(user_id: int, asset_type: str, meta: dict):
+    if not USE_SUPABASE or meta.get("direction") == "WAIT":
+        return
+    payload = {
+        "user_id": str(user_id),
+        "symbol": meta.get("symbol"),
+        "asset_type": asset_type,
+        "direction": meta.get("direction"),
+        "entry_low": meta.get("entry_low"),
+        "entry_high": meta.get("entry_high"),
+        "stop_loss": meta.get("stop_loss"),
+        "tp1": meta.get("tp1"),
+        "tp2": meta.get("tp2"),
+        "tp3": meta.get("tp3"),
+        "confidence": meta.get("confidence"),
+        "status": "RUNNING",
+        "profit_percent": 0,
+        "created_at": now_utc().isoformat(),
+        "updated_at": now_utc().isoformat(),
+    }
+    sb_post(VIP_HISTORY_TABLE, payload)
+
+
+def fetch_for_asset(symbol: str, asset_type: str):
+    if asset_type == "crypto":
+        return fetch_crypto_klines(symbol, "15", 150)
+    return fetch_twelvedata(symbol, asset_type)
+
+
+def evaluate_signal_outcome(row: dict):
+    try:
+        df = fetch_for_asset(row["symbol"], row.get("asset_type", "crypto"))
+        created = parse_dt(row.get("created_at")) or (now_utc() - timedelta(days=3))
+        if "time" in df.columns:
+            df["_time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df[df["_time"] >= created]
+        if df.empty:
+            return None
+
+        direction = row.get("direction", "")
+        stop = float(row.get("stop_loss"))
+        tp1 = float(row.get("tp1"))
+        tp2 = float(row.get("tp2"))
+        tp3 = float(row.get("tp3"))
+        entry_mid = (float(row.get("entry_low")) + float(row.get("entry_high"))) / 2
+
+        for _, c in df.iterrows():
+            high = float(c["high"])
+            low = float(c["low"])
+            if "BUY" in direction:
+                if low <= stop:
+                    return "LOSS", round(((stop - entry_mid) / entry_mid) * 100, 2)
+                if high >= tp3:
+                    return "WIN", round(((tp3 - entry_mid) / entry_mid) * 100, 2)
+                if high >= tp2:
+                    return "WIN", round(((tp2 - entry_mid) / entry_mid) * 100, 2)
+                if high >= tp1:
+                    return "WIN", round(((tp1 - entry_mid) / entry_mid) * 100, 2)
+            elif "SELL" in direction:
+                if high >= stop:
+                    return "LOSS", round(((entry_mid - stop) / entry_mid) * 100, 2)
+                if low <= tp3:
+                    return "WIN", round(((entry_mid - tp3) / entry_mid) * 100, 2)
+                if low <= tp2:
+                    return "WIN", round(((entry_mid - tp2) / entry_mid) * 100, 2)
+                if low <= tp1:
+                    return "WIN", round(((entry_mid - tp1) / entry_mid) * 100, 2)
+    except Exception as e:
+        logger.warning("Signal outcome check failed: %s", e)
+    return None
+
+
+async def update_vip_results(context: ContextTypes.DEFAULT_TYPE = None):
+    if not USE_SUPABASE:
+        return
+    rows = sb_get(VIP_HISTORY_TABLE, {"status": "eq.RUNNING", "select": "*", "limit": "100"}) or []
+    for row in rows:
+        result = evaluate_signal_outcome(row)
+        if not result:
+            continue
+        status, profit_percent = result
+        sb_patch(VIP_HISTORY_TABLE, {"id": f"eq.{row['id']}"}, {
+            "status": status,
+            "profit_percent": profit_percent,
+            "updated_at": now_utc().isoformat(),
+        })
+
+
+async def send_vip_history(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await update_vip_results(context)
+    if not USE_SUPABASE:
+        await context.bot.send_message(chat_id=chat_id, text="📜 VIP history needs Supabase env variables configured.")
+        return
+    rows = sb_get(VIP_HISTORY_TABLE, {
+        "user_id": f"eq.{user_id}",
+        "select": "*",
+        "order": "created_at.desc",
+        "limit": "10",
+    }) or []
+    if not rows:
+        await context.bot.send_message(chat_id=chat_id, text="📜 No VIP signal history yet. Request VIP signals first.")
+        return
+    lines = ["📜 *Your Last VIP Signals*\n"]
+    for r in rows:
+        icon = "✅" if r.get("status") == "WIN" else "❌" if r.get("status") == "LOSS" else "⏳"
+        profit = float(r.get("profit_percent") or 0)
+        lines.append(f"{icon} `{r.get('symbol')}` {r.get('direction')} | {r.get('status')} | {profit:+.2f}%")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+
+
+async def send_vip_performance(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, admin_all=False):
+    await update_vip_results(context)
+    if not USE_SUPABASE:
+        await context.bot.send_message(chat_id=chat_id, text="📊 VIP performance needs Supabase env variables configured.")
+        return
+    params = {"select": "*", "limit": "500"}
+    if not admin_all:
+        params["user_id"] = f"eq.{user_id}"
+    rows = sb_get(VIP_HISTORY_TABLE, params) or []
+    if not rows:
+        await context.bot.send_message(chat_id=chat_id, text="📊 No VIP performance data yet.")
+        return
+
+    closed = [r for r in rows if r.get("status") in ["WIN", "LOSS"]]
+    wins = sum(1 for r in closed if r.get("status") == "WIN")
+    losses = sum(1 for r in closed if r.get("status") == "LOSS")
+    running = sum(1 for r in rows if r.get("status") == "RUNNING")
+    total_pct = sum(float(r.get("profit_percent") or 0) for r in closed)
+    win_rate = round((wins / len(closed)) * 100, 1) if closed else 0
+
+    yesterday = (now_utc() - timedelta(days=1)).date()
+    y_rows = [r for r in closed if parse_dt(r.get("created_at")) and parse_dt(r.get("created_at")).date() == yesterday]
+    y_pct = sum(float(r.get("profit_percent") or 0) for r in y_rows)
+    y_wins = sum(1 for r in y_rows if r.get("status") == "WIN")
+    y_losses = sum(1 for r in y_rows if r.get("status") == "LOSS")
+
+    text = (
+        "📊 *VIP Signal Performance*\n\n"
+        f"Yesterday: *{y_wins} Wins*, *{y_losses} Losses* `({y_pct:+.2f}%)`\n"
+        f"All Time: *{wins} Wins*, *{losses} Losses*, *{running} Running*\n"
+        f"Win Rate: *{win_rate}%*\n"
+        f"Total Result: `{total_pct:+.2f}%`\n\n"
+        "⚠️ Percentages are based on signal entry to TP/SL movement."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+
+async def vip_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    await send_vip_history(update.effective_chat.id, update.effective_user.id, context)
+
+
+async def vip_performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    admin_all = update.effective_user.id == ADMIN_ID and context.args and context.args[0].lower() == "all"
+    await send_vip_performance(update.effective_chat.id, update.effective_user.id, context, admin_all=admin_all)
+
+
+async def givepremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Use: /givepremium USER_ID 24\nExample: /givepremium 123456789 72")
+        return
+    try:
+        target_user = int(context.args[0])
+        hours = 24
+        if len(context.args) >= 2:
+            raw = context.args[1].lower().strip()
+            if raw.endswith("d"):
+                hours = int(raw.replace("d", "")) * 24
+            else:
+                hours = int(raw)
+        expires = activate_premium(target_user, hours, source="admin")
+        await update.message.reply_text(f"✅ Premium activated for {target_user} until {expires.strftime('%Y-%m-%d %H:%M UTC')}.")
+        try:
+            await context.bot.send_message(
+                chat_id=target_user,
+                text=f"✅ *Premium activated by admin!*\n\nExpires: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+
+async def premium_expiry_reminder_check(context: ContextTypes.DEFAULT_TYPE):
+    if not USE_SUPABASE:
+        return
+    rows = sb_get(PREMIUM_TABLE, {"select": "*", "limit": "1000"}) or []
+    current = now_utc()
+    for row in rows:
+        user_id = int(row["user_id"])
+        expires = parse_dt(row.get("expires_at"))
+        if not expires:
+            continue
+        remaining = expires - current
+        patch = {}
+        try:
+            if timedelta(hours=1) < remaining <= timedelta(hours=6) and not row.get("remind_6h_sent"):
+                await context.bot.send_message(chat_id=user_id, text="⏰ Your Premium expires in about 6 hours. Renew to continue enjoying VIP signals.")
+                patch["remind_6h_sent"] = True
+            elif timedelta(0) < remaining <= timedelta(hours=1) and not row.get("remind_1h_sent"):
+                await context.bot.send_message(chat_id=user_id, text="⏰ Your Premium expires in about 1 hour. Renew now to avoid interruption.")
+                patch["remind_1h_sent"] = True
+            elif remaining <= timedelta(0) and not row.get("expired_notice_sent"):
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"💳 Renew Premium KSh {PREMIUM_PRICE}", callback_data="pay_premium")]])
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "❌ *Premium subscription ended.*\n\n"
+                        "Renew to continue enjoying:\n"
+                        "• VIP Crypto Signals\n• Forex Signals\n• Stock Signals\n• SMC Analysis\n• High-confidence Setups"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+                patch["expired_notice_sent"] = True
+            if patch:
+                patch["updated_at"] = now_utc().isoformat()
+                sb_patch(PREMIUM_TABLE, {"user_id": f"eq.{user_id}"}, patch)
+        except Exception as e:
+            logger.warning("Premium reminder failed for %s: %s", user_id, e)
+
+
+async def maintenance_check(context: ContextTypes.DEFAULT_TYPE):
+    await update_vip_results(context)
+    await premium_expiry_reminder_check(context)
+
 async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
     if not active:
@@ -981,7 +1373,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
     for symbol in CRYPTO_WATCHLIST:
         try:
             meta = await score_symbol(symbol, "crypto")
-            if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE:
+            if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
                 meta["asset_type"] = "crypto"
                 candidates.append(meta)
         except Exception as e:
@@ -991,7 +1383,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         for symbol in FOREX_WATCHLIST:
             try:
                 meta = await score_symbol(symbol, "forex")
-                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE:
+                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
                     meta["asset_type"] = "forex"
                     candidates.append(meta)
             except Exception as e:
@@ -1000,7 +1392,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         for symbol in STOCK_WATCHLIST:
             try:
                 meta = await score_symbol(symbol, "stock")
-                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE:
+                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
                     meta["asset_type"] = "stock"
                     candidates.append(meta)
             except Exception as e:
@@ -1043,15 +1435,29 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, symbol: str, asset_type="crypto", premium=False):
+    meta = None
     if asset_type == "crypto":
         signal = await build_crypto_signal(symbol, vip=premium)
+        if premium:
+            df = fetch_crypto_klines(symbol, "15", 150)
+            mtf = {}
+            for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+                try:
+                    mtf[tf_label] = simple_trend(fetch_crypto_klines(symbol, interval, 150))
+                except Exception:
+                    mtf[tf_label] = "Unavailable"
+            meta = generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
     elif asset_type in ["forex", "stock"]:
         df = fetch_twelvedata(symbol, asset_type)
         signal = generate_signal(df, symbol, mtf=None, vip=premium, lock_free=not premium)
+        if premium:
+            meta = generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
     else:
         raise ValueError("Asset type must be crypto, forex, or stock.")
 
     await context.bot.send_message(chat_id=chat_id, text=signal, parse_mode="Markdown")
+    if premium and meta:
+        save_vip_signal(user_id, asset_type, meta)
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1093,9 +1499,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     clean = text.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
 
-    crypto_shortcuts = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "WLD", "CELO", "AVAX", "LINK"]
-    forex_symbols = ["EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCHF", "GBPJPY", "EURJPY", "XAUUSD", "XAGUSD"]
-    stock_symbols = ["AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "AMD", "NFLX"]
+    crypto_shortcuts = [s.replace("USDT", "") for s in CRYPTO_WATCHLIST]
+    forex_symbols = [s.replace("/", "") for s in FOREX_WATCHLIST]
+    stock_symbols = STOCK_WATCHLIST
 
     if clean in crypto_shortcuts:
         clean = clean + "USDT"
@@ -1234,10 +1640,14 @@ def main():
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("premium", premium_command))
+    app.add_handler(CommandHandler("givepremium", givepremium))
+    app.add_handler(CommandHandler("viphistory", vip_history_command))
+    app.add_handler(CommandHandler("vipperformance", vip_performance_command))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.job_queue.run_repeating(scheduled_news_check, interval=NEWS_CHECK_MINUTES * 60, first=20)
+    app.job_queue.run_repeating(maintenance_check, interval=15 * 60, first=60)
 
     print("Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

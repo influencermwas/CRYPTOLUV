@@ -14,6 +14,7 @@ from bot import (
     analyze,
     news_command,
     broadcast,
+    premium_command,
     button_click,
     text_handler,
     scheduled_news_check,
@@ -35,6 +36,7 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("analyze", analyze))
 telegram_app.add_handler(CommandHandler("news", news_command))
 telegram_app.add_handler(CommandHandler("broadcast", broadcast))
+telegram_app.add_handler(CommandHandler("premium", premium_command))
 telegram_app.add_handler(CallbackQueryHandler(button_click))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -77,6 +79,7 @@ def set_webhook():
             BotCommand("start", "Open main menu"),
             BotCommand("analyze", "Analyze crypto, forex or stock"),
             BotCommand("news", "Check market news alerts"),
+            BotCommand("premium", "Get premium VIP signals"),
             BotCommand("broadcast", "Admin broadcast message"),
         ])
     )

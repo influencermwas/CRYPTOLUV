@@ -330,8 +330,8 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     confidence = min(90, max(45, 50 + abs(bullish - bearish) * 10))
     risk = "Low" if confidence >= 75 else "Medium" if confidence >= 60 else "High"
 
-    f"📊 *{symbol.upper()} Signal*\n"
-f"🏷 *INFLUENCERTECH SIGNALS*\n\n"
+    return (
+        f"📊 *{symbol.upper()} Signal*\n\n"
         f"Direction: *{direction}*\n"
         f"Current Price: `{close:.6g}`\n"
         f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"

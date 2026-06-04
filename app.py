@@ -5,12 +5,11 @@ import logging
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
 from bot import (
     BOT_TOKEN,
-    ADMIN_ID,
     start,
     analyze,
     news_command,
@@ -46,7 +45,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def home():
-    return "Market Signal Bot Webhook is running ✅"
+    return "INFLUENCERTECH SIGNALS Bot is running ✅"
 
 
 @app.post("/webhook")
@@ -67,9 +66,23 @@ def set_webhook():
         return jsonify({"ok": False, "error": "PUBLIC_URL is missing in environment variables"}), 400
 
     webhook_url = f"{PUBLIC_URL}/webhook"
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     response = requests.post(url, json={"url": webhook_url}, timeout=20)
-    return jsonify(response.json())
+
+    loop.run_until_complete(
+        telegram_app.bot.set_my_commands([
+            BotCommand("start", "Open main menu"),
+            BotCommand("analyze", "Analyze crypto, forex or stock"),
+            BotCommand("news", "Check market news alerts"),
+            BotCommand("broadcast", "Admin broadcast message"),
+        ])
+    )
+
+    return jsonify({
+        "webhook": response.json(),
+        "menu": "Telegram command menu added successfully"
+    })
 
 
 @app.get("/delete_webhook")
@@ -81,8 +94,6 @@ def delete_webhook():
 
 @app.get("/check_news")
 def check_news():
-    # Use this endpoint with UptimeRobot/Cron-job.org to trigger news broadcasts.
-    # If CRON_SECRET is set, open /check_news?secret=YOUR_SECRET
     if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 

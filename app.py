@@ -1,12 +1,13 @@
 import os
 import asyncio
 import logging
+import re
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 from bot import (
     BOT_TOKEN,
@@ -34,6 +35,33 @@ telegram_app.add_handler(CommandHandler("analyze", analyze))
 telegram_app.add_handler(CommandHandler("news", news_command))
 telegram_app.add_handler(CommandHandler("broadcast", broadcast))
 telegram_app.add_handler(CallbackQueryHandler(button_click))
+
+
+async def text_analysis(update: Update, context):
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+
+    clean = text.upper().replace(" ", "").replace("-", "").replace("/", "")
+
+    greetings = {"HI", "HELLO", "HEY", "MENU", "START"}
+    if clean in greetings:
+        await start(update, context)
+        return
+
+    # Auto-analyze typed symbols like BTCUSDT, ETHUSDT, SOLUSDT.
+    # For forex/stocks users can still use /analyze EUR/USD forex or /analyze AAPL stock.
+    if re.fullmatch(r"[A-Z0-9]{3,15}", clean):
+        context.args = [clean]
+        await analyze(update, context)
+        return
+
+    await update.message.reply_text(
+        "Send a symbol like BTCUSDT, ETHUSDT, SOLUSDT, or use /start for the menu."
+    )
+
+
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_analysis))
 
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -66,7 +94,6 @@ def set_webhook():
         return jsonify({"ok": False, "error": "PUBLIC_URL is missing in environment variables"}), 400
 
     webhook_url = f"{PUBLIC_URL}/webhook"
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     response = requests.post(url, json={"url": webhook_url}, timeout=20)
 
@@ -81,7 +108,8 @@ def set_webhook():
 
     return jsonify({
         "webhook": response.json(),
-        "menu": "Telegram command menu added successfully"
+        "menu": "Telegram command menu added successfully",
+        "auto_analysis": "Users can now type BTCUSDT directly"
     })
 
 

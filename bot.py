@@ -99,16 +99,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Example commands:\n"
         "`/analyze BTCUSDT`\n"
         "`/analyze ETHUSDT`\n"
+        "`/analyze SOLUSDT`\n"
         "`/analyze EUR/USD forex`\n"
         "`/analyze AAPL stock`\n\n"
         "⚠️ Signals are not guaranteed. Always use stop loss."
     )
 
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_menu()
-    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
 
 
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -120,34 +117,21 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "crypto_help":
         await query.edit_message_text(
-            "📈 Crypto examples:\n\n"
-            "/analyze BTCUSDT\n"
-            "/analyze ETHUSDT\n"
-            "/analyze SOLUSDT",
-            reply_markup=main_menu()
+            "📈 Crypto examples:\n\n/analyze BTCUSDT\n/analyze ETHUSDT\n/analyze SOLUSDT",
+            reply_markup=main_menu(),
         )
-
     elif data == "forex_help":
         await query.edit_message_text(
-            "📊 Forex examples:\n\n"
-            "/analyze EUR/USD forex\n"
-            "/analyze XAU/USD forex\n\n"
-            "Requires TWELVEDATA_API_KEY.",
-            reply_markup=main_menu()
+            "📊 Forex examples:\n\n/analyze EUR/USD forex\n/analyze XAU/USD forex\n\nRequires TWELVEDATA_API_KEY.",
+            reply_markup=main_menu(),
         )
-
     elif data == "stock_help":
         await query.edit_message_text(
-            "🏦 Stock examples:\n\n"
-            "/analyze AAPL stock\n"
-            "/analyze TSLA stock\n\n"
-            "Requires TWELVEDATA_API_KEY.",
-            reply_markup=main_menu()
+            "🏦 Stock examples:\n\n/analyze AAPL stock\n/analyze TSLA stock\n\nRequires TWELVEDATA_API_KEY.",
+            reply_markup=main_menu(),
         )
-
     elif data == "news":
         await send_news_to_chat(query.message.chat_id, context)
-
     elif data == "risk":
         await query.edit_message_text(
             "⚠️ Risk rules:\n\n"
@@ -155,40 +139,48 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2. Avoid trading during high-impact news.\n"
             "3. Always use stop loss.\n"
             "4. Wait for confirmation before entry.",
-            reply_markup=main_menu()
+            reply_markup=main_menu(),
         )
 
 
-def fetch_binance_klines(symbol="BTCUSDT", interval="15", limit=150):
-    """
-    Fetch crypto candles from Bybit.
-    Function name kept as fetch_binance_klines so the rest of the bot still works.
-    Binance gives 451 error on Render, so we use Bybit instead.
-    """
-
+def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
     symbol = symbol.upper().replace("/", "").replace("-", "")
 
-    url = "https://api.bybit.com/v5/market/kline"
+    if symbol.endswith("USDT"):
+        base = symbol.replace("USDT", "")
+        inst_id = f"{base}-USDT"
+    elif symbol.endswith("USD"):
+        base = symbol.replace("USD", "")
+        inst_id = f"{base}-USD"
+    else:
+        inst_id = symbol
 
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
+    bar = "15m"
+    if str(interval) in ["1", "3", "5", "15", "30"]:
+        bar = f"{interval}m"
+    elif str(interval) in ["60", "1h"]:
+        bar = "1H"
+    elif str(interval) in ["240", "4h"]:
+        bar = "4H"
+    elif str(interval) in ["1d", "D"]:
+        bar = "1D"
 
-    r = requests.get(url, params=params, timeout=20)
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {"instId": inst_id, "bar": bar, "limit": str(limit)}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    r = requests.get(url, params=params, headers=headers, timeout=20)
     r.raise_for_status()
 
     data = r.json()
+    if data.get("code") != "0":
+        raise Exception(data.get("msg", "OKX API Error"))
 
-    if data.get("retCode") != 0:
-        raise Exception(data.get("retMsg", "Bybit API Error"))
-
-    candles = data["result"]["list"]
+    candles = data.get("data", [])
+    if not candles:
+        raise Exception(f"No candle data returned for {inst_id}")
 
     rows = []
-
     for c in reversed(candles):
         rows.append({
             "open": float(c[1]),
@@ -199,11 +191,15 @@ def fetch_binance_klines(symbol="BTCUSDT", interval="15", limit=150):
         })
 
     df = pd.DataFrame(rows)
-
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
 
     return df
+
+
+# Kept old name so app.py/older code does not break
+def fetch_binance_klines(symbol="BTCUSDT", interval="15", limit=150):
+    return fetch_crypto_klines(symbol, interval, limit)
 
 
 def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=150):
@@ -211,7 +207,6 @@ def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=
         raise ValueError("Twelve Data API key is missing. Add TWELVEDATA_API_KEY in Render Environment Variables.")
 
     url = "https://api.twelvedata.com/time_series"
-
     params = {
         "symbol": symbol,
         "interval": interval,
@@ -223,7 +218,6 @@ def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=
     r.raise_for_status()
 
     data = r.json()
-
     if "values" not in data:
         raise ValueError(str(data))
 
@@ -234,13 +228,11 @@ def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=
         df[col] = pd.to_numeric(df[col])
 
     df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
-
     return df
 
 
 def add_indicators(df: pd.DataFrame):
     df = df.copy()
-
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
@@ -248,22 +240,18 @@ def add_indicators(df: pd.DataFrame):
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
-
     rs = gain / loss.replace(0, math.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
-
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-
     return df
 
 
 def generate_signal(df: pd.DataFrame, symbol: str):
     df = add_indicators(df)
-
     last = df.iloc[-1]
 
     close = float(last["close"])
@@ -324,7 +312,6 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         stop = min(support, close * 0.985)
         tp1 = close * 1.015
         tp2 = close * 1.030
-
     elif bearish > bullish:
         direction = "SELL / SHORT"
         entry_low = close * 0.998
@@ -332,7 +319,6 @@ def generate_signal(df: pd.DataFrame, symbol: str):
         stop = max(resistance, close * 1.015)
         tp1 = close * 0.985
         tp2 = close * 0.970
-
     else:
         direction = "WAIT"
         entry_low = close
@@ -369,6 +355,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use:\n"
             "/analyze BTCUSDT\n"
             "/analyze ETHUSDT\n"
+            "/analyze SOLUSDT\n"
             "/analyze EUR/USD forex\n"
             "/analyze AAPL stock"
         )
@@ -379,19 +366,15 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if asset_type == "crypto":
-            df = fetch_binance_klines(symbol, "15", 150)
-
+            df = fetch_crypto_klines(symbol, "15", 150)
         elif asset_type in ["forex", "stock"]:
             df = fetch_twelvedata(symbol, asset_type)
-
         else:
             await update.message.reply_text("Asset type must be crypto, forex, or stock.")
             return
 
         signal = generate_signal(df, symbol)
-
         await update.message.reply_text(signal, parse_mode="Markdown")
-
     except Exception as e:
         logger.exception("Analyze error")
         await update.message.reply_text(f"❌ Could not analyze {symbol}. Error: {e}")
@@ -404,7 +387,6 @@ def scan_news():
 
     for feed_url in NEWS_FEEDS:
         feed = feedparser.parse(feed_url)
-
         for entry in feed.entries[:5]:
             title = entry.get("title", "")
             link = entry.get("link", "")
@@ -415,7 +397,6 @@ def scan_news():
 
             lowered = title.lower()
             matched = []
-
             for word, reason in RISK_KEYWORDS.items():
                 if word in lowered:
                     matched.append(reason)
@@ -429,13 +410,11 @@ def scan_news():
                 seen.append(key)
 
     save_json(NEWS_FILE, seen[-500:])
-
     return results
 
 
 def format_news_alert(item):
     reasons = ", ".join(item["reason"])
-
     return (
         "🚨 *MARKET NEWS ALERT*\n\n"
         f"Impact: *High Risk*\n"
@@ -455,36 +434,23 @@ async def send_news_to_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     items = scan_news()
 
     if not items:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="📰 No new high-risk market news detected right now."
-        )
+        await context.bot.send_message(chat_id=chat_id, text="📰 No new high-risk market news detected right now.")
         return
 
     for item in items[:5]:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=format_news_alert(item),
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=chat_id, text=format_news_alert(item), parse_mode="Markdown")
 
 
 async def scheduled_news_check(context: ContextTypes.DEFAULT_TYPE):
     items = scan_news()
-
     if not items:
         return
 
     users = load_json(USERS_FILE, [])
-
     for user_id in users:
         for item in items[:3]:
             try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=format_news_alert(item),
-                    parse_mode="Markdown"
-                )
+                await context.bot.send_message(chat_id=user_id, text=format_news_alert(item), parse_mode="Markdown")
             except Exception as e:
                 logger.warning("Failed to send news to %s: %s", user_id, e)
 
@@ -495,21 +461,15 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     message = " ".join(context.args)
-
     if not message:
         await update.message.reply_text("Use: /broadcast your message")
         return
 
     users = load_json(USERS_FILE, [])
     sent = 0
-
     for user_id in users:
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📢 *Broadcast*\n\n{message}",
-                parse_mode="Markdown"
-            )
+            await context.bot.send_message(chat_id=user_id, text=f"📢 *Broadcast*\n\n{message}", parse_mode="Markdown")
             sent += 1
         except Exception:
             pass
@@ -522,18 +482,13 @@ def main():
         raise RuntimeError("BOT_TOKEN missing. Add it in .env or Render Environment Variables.")
 
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(button_click))
 
-    app.job_queue.run_repeating(
-        scheduled_news_check,
-        interval=NEWS_CHECK_MINUTES * 60,
-        first=20
-    )
+    app.job_queue.run_repeating(scheduled_news_check, interval=NEWS_CHECK_MINUTES * 60, first=20)
 
     print("Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

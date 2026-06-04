@@ -331,20 +331,24 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     risk = "Low" if confidence >= 75 else "Medium" if confidence >= 60 else "High"
 
     return (
-        f"📊 *{symbol.upper()} Signal*\n\n"
-        f"Direction: *{direction}*\n"
-        f"Current Price: `{close:.6g}`\n"
-        f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
-        f"Stop Loss: `{stop:.6g}`\n"
-        f"Take Profit 1: `{tp1:.6g}`\n"
-        f"Take Profit 2: `{tp2:.6g}`\n\n"
-        f"Support: `{support:.6g}`\n"
-        f"Resistance: `{resistance:.6g}`\n"
-        f"Risk: *{risk}*\n"
-        f"Confidence: *{confidence}%*\n\n"
-        "Reason:\n- " + "\n- ".join(reasons) +
-        "\n\n⚠️ This is analysis only, not guaranteed profit."
-    )
+f"📊 *{symbol.upper()} Signal*\n"
+f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+f"Direction: *{direction}*\n"
+f"Current Price: `{close:.6g}`\n"
+f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
+f"Stop Loss: `{stop:.6g}`\n"
+f"Take Profit 1: `{tp1:.6g}`\n"
+f"Take Profit 2: `{tp2:.6g}`\n\n"
+f"Support: `{support:.6g}`\n"
+f"Resistance: `{resistance:.6g}`\n"
+f"Risk: *{risk}*\n"
+f"Confidence: *{confidence}%*\n\n"
+"Reason:\n- " + "\n- ".join(reasons) +
+"\n\n━━━━━━━━━━━━━━━━━━\n"
+"🔥 *INFLUENCERTECH SIGNALS* 🔥\n"
+"⚠️ This is analysis only, not guaranteed profit."
+)
+
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):

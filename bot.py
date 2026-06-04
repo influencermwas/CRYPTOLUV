@@ -1,7 +1,9 @@
 import os
 import json
 import math
+import base64
 import logging
+from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
@@ -12,7 +14,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 load_dotenv()
@@ -22,8 +26,20 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 NEWS_CHECK_MINUTES = int(os.getenv("NEWS_CHECK_MINUTES", "5") or 5)
 
+PREMIUM_PRICE = int(os.getenv("PREMIUM_PRICE", "35") or 35)
+
+MPESA_ENV = os.getenv("MPESA_ENV", "sandbox").strip().lower()  # sandbox or live
+MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY", "").strip()
+MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET", "").strip()
+MPESA_SHORTCODE = os.getenv("MPESA_SHORTCODE", "").strip()
+MPESA_PASSKEY = os.getenv("MPESA_PASSKEY", "").strip()
+MPESA_CALLBACK_URL = os.getenv("MPESA_CALLBACK_URL", "").strip()
+MPESA_TRANSACTION_TYPE = os.getenv("MPESA_TRANSACTION_TYPE", "CustomerPayBillOnline").strip()
+
 USERS_FILE = "users.json"
 NEWS_FILE = "seen_news.json"
+PREMIUM_FILE = "premium_users.json"
+PENDING_FILE = "pending_payments.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -59,6 +75,10 @@ NEWS_FEEDS = [
 ]
 
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -79,21 +99,41 @@ def register_user(user_id: int):
         save_json(USERS_FILE, users)
 
 
+def is_premium(user_id: int):
+    premium = load_json(PREMIUM_FILE, {})
+    expires = premium.get(str(user_id))
+    if not expires:
+        return False, None
+    try:
+        expires_dt = datetime.fromisoformat(expires)
+        if expires_dt > now_utc():
+            return True, expires_dt
+    except Exception:
+        pass
+    return False, None
+
+
+def activate_premium(user_id: int, hours=24):
+    premium = load_json(PREMIUM_FILE, {})
+    expires_dt = now_utc() + timedelta(hours=hours)
+    premium[str(user_id)] = expires_dt.isoformat()
+    save_json(PREMIUM_FILE, premium)
+    return expires_dt
+
+
 def main_menu():
     keyboard = [
         [
-            InlineKeyboardButton("₿ BTC", callback_data="quick:BTCUSDT"),
-            InlineKeyboardButton("Ξ ETH", callback_data="quick:ETHUSDT"),
-            InlineKeyboardButton("◎ SOL", callback_data="quick:SOLUSDT"),
+            InlineKeyboardButton("⚡ BTC", callback_data="quick_BTCUSDT"),
+            InlineKeyboardButton("⚡ ETH", callback_data="quick_ETHUSDT"),
+            InlineKeyboardButton("⚡ SOL", callback_data="quick_SOLUSDT"),
         ],
         [
-            InlineKeyboardButton("XRP", callback_data="quick:XRPUSDT"),
-            InlineKeyboardButton("BNB", callback_data="quick:BNBUSDT"),
-            InlineKeyboardButton("DOGE", callback_data="quick:DOGEUSDT"),
+            InlineKeyboardButton("⚡ XRP", callback_data="quick_XRPUSDT"),
+            InlineKeyboardButton("⚡ BNB", callback_data="quick_BNBUSDT"),
+            InlineKeyboardButton("⚡ DOGE", callback_data="quick_DOGEUSDT"),
         ],
-        [InlineKeyboardButton("📈 Analyze Crypto", callback_data="crypto_help")],
-        [InlineKeyboardButton("📊 Analyze Forex", callback_data="forex_help")],
-        [InlineKeyboardButton("🏦 Analyze Stock", callback_data="stock_help")],
+        [InlineKeyboardButton("💎 Premium Signals", callback_data="premium")],
         [InlineKeyboardButton("📰 Market News", callback_data="news")],
         [InlineKeyboardButton("⚠️ Risk Rules", callback_data="risk")],
     ]
@@ -102,18 +142,16 @@ def main_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
+    active, expires = is_premium(update.effective_user.id)
+    premium_text = f"✅ Premium active until `{expires.strftime('%Y-%m-%d %H:%M UTC')}`" if active else "🔒 Premium locked"
+
     text = (
         "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
-        "I analyze crypto, forex and stocks using technical indicators, news risk and SMC-style tools.\n\n"
-        "Analysis includes:\n"
-        "EMA, RSI, MACD, Volume, Support/Resistance, Multi-Timeframe Trend,\n"
-        "Liquidity Sweeps, Order Blocks, CHoCH, BOS and FVG.\n\n"
-        "Example commands:\n"
-        "`/analyze BTCUSDT`\n"
-        "`/analyze ETHUSDT`\n"
-        "`/analyze SOLUSDT`\n"
-        "`/analyze EUR/USD forex`\n"
-        "`/analyze AAPL stock`\n\n"
+        "Send a symbol directly, example:\n"
+        "`BTCUSDT`, `ETHUSDT`, `SOLUSDT`\n\n"
+        "Or tap quick analysis buttons below.\n\n"
+        f"{premium_text}\n\n"
+        "Premium is KSh 35 for 24 hours.\n"
         "⚠️ Signals are not guaranteed. Always use stop loss."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu())
@@ -125,26 +163,25 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(query.from_user.id)
     data = query.data
 
-    if data.startswith("quick:"):
-        symbol = data.split(":", 1)[1]
-        await query.edit_message_text(f"⏳ Analyzing {symbol}...")
-        await send_analysis_result(query.message.chat_id, symbol, "crypto", context)
-        return
-
-    if data == "crypto_help":
-        await query.edit_message_text(
-            "📈 Crypto examples:\n\n/analyze BTCUSDT\n/analyze ETHUSDT\n/analyze SOLUSDT",
-            reply_markup=main_menu(),
-        )
-    elif data == "forex_help":
-        await query.edit_message_text(
-            "📊 Forex examples:\n\n/analyze EUR/USD forex\n/analyze XAU/USD forex\n\nRequires TWELVEDATA_API_KEY.",
-            reply_markup=main_menu(),
-        )
-    elif data == "stock_help":
-        await query.edit_message_text(
-            "🏦 Stock examples:\n\n/analyze AAPL stock\n/analyze TSLA stock\n\nRequires TWELVEDATA_API_KEY.",
-            reply_markup=main_menu(),
+    if data.startswith("quick_"):
+        symbol = data.replace("quick_", "")
+        await send_analysis(query.message.chat_id, query.from_user.id, context, symbol, "crypto", premium=False)
+    elif data == "premium":
+        await show_premium(query.message.chat_id, query.from_user.id, context)
+    elif data == "vip_signal":
+        await premium_signal(query.message.chat_id, query.from_user.id, context)
+    elif data == "pay_premium":
+        context.user_data["awaiting_premium_phone"] = True
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "💎 *Premium Subscription*\n\n"
+                f"Price: *KSh {PREMIUM_PRICE}*\n"
+                "Duration: *24 hours*\n\n"
+                "Send your M-Pesa number now.\n"
+                "Example: `0712345678`"
+            ),
+            parse_mode="Markdown",
         )
     elif data == "news":
         await send_news_to_chat(query.message.chat_id, context)
@@ -154,10 +191,190 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1. Never risk more than 1-2% per trade.\n"
             "2. Avoid trading during high-impact news.\n"
             "3. Always use stop loss.\n"
-            "4. Wait for confirmation before entry.\n"
-            "5. Do not enter blindly just because the bot says BUY/SELL.",
+            "4. Wait for confirmation before entry.",
             reply_markup=main_menu(),
         )
+
+
+async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    active, expires = is_premium(user_id)
+    if active:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Get VIP Signal", callback_data="vip_signal")]])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ *Premium Active*\n\n"
+                f"Expires: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+                "Tap below to receive VIP signal."
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay KSh 35 via M-Pesa", callback_data="pay_premium")]])
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "💎 *INFLUENCERTECH VIP SIGNALS*\n\n"
+            f"Price: *KSh {PREMIUM_PRICE}*\n"
+            "Access: *24 hours*\n\n"
+            "Includes:\n"
+            "🔥 VIP entries\n"
+            "🔥 TP1 / TP2 / TP3\n"
+            "🔥 Stop loss\n"
+            "🔥 CHoCH, BOS, FVG\n"
+            "🔥 Order block and liquidity sweep\n\n"
+            "Tap below to pay automatically using STK Push."
+        ),
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+def normalize_phone(phone: str):
+    phone = "".join(ch for ch in phone if ch.isdigit())
+    if phone.startswith("0") and len(phone) == 10:
+        return "254" + phone[1:]
+    if phone.startswith("254") and len(phone) == 12:
+        return phone
+    if phone.startswith("7") and len(phone) == 9:
+        return "254" + phone
+    raise ValueError("Invalid phone number. Use format 0712345678 or 254712345678.")
+
+
+def mpesa_base_url():
+    if MPESA_ENV == "live":
+        return "https://api.safaricom.co.ke"
+    return "https://sandbox.safaricom.co.ke"
+
+
+def get_mpesa_token():
+    if not MPESA_CONSUMER_KEY or not MPESA_CONSUMER_SECRET:
+        raise ValueError("M-Pesa consumer key/secret missing.")
+
+    url = f"{mpesa_base_url()}/oauth/v1/generate?grant_type=client_credentials"
+    r = requests.get(url, auth=(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET), timeout=20)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def send_stk_push(user_id: int, phone: str):
+    if not MPESA_SHORTCODE or not MPESA_PASSKEY or not MPESA_CALLBACK_URL:
+        raise ValueError("M-Pesa shortcode/passkey/callback URL missing in Render Environment Variables.")
+
+    access_token = get_mpesa_token()
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    password_raw = f"{MPESA_SHORTCODE}{MPESA_PASSKEY}{timestamp}"
+    password = base64.b64encode(password_raw.encode()).decode()
+
+    url = f"{mpesa_base_url()}/mpesa/stkpush/v1/processrequest"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+    payload = {
+        "BusinessShortCode": MPESA_SHORTCODE,
+        "Password": password,
+        "Timestamp": timestamp,
+        "TransactionType": MPESA_TRANSACTION_TYPE,
+        "Amount": PREMIUM_PRICE,
+        "PartyA": phone,
+        "PartyB": MPESA_SHORTCODE,
+        "PhoneNumber": phone,
+        "CallBackURL": MPESA_CALLBACK_URL,
+        "AccountReference": f"VIP{user_id}",
+        "TransactionDesc": "InfluencerTech VIP Signals",
+    }
+
+    r = requests.post(url, json=payload, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("ResponseCode") != "0":
+        raise Exception(data.get("errorMessage") or data.get("ResponseDescription") or str(data))
+
+    checkout_id = data.get("CheckoutRequestID")
+    pending = load_json(PENDING_FILE, {})
+    pending[checkout_id] = {
+        "user_id": user_id,
+        "phone": phone,
+        "amount": PREMIUM_PRICE,
+        "created_at": now_utc().isoformat(),
+    }
+    save_json(PENDING_FILE, pending)
+    return data
+
+
+async def handle_premium_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    raw_phone = update.message.text.strip()
+
+    try:
+        phone = normalize_phone(raw_phone)
+        await update.message.reply_text("📲 Sending M-Pesa STK Push. Check your phone and enter PIN...")
+
+        data = send_stk_push(user_id, phone)
+        checkout_id = data.get("CheckoutRequestID", "pending")
+
+        await update.message.reply_text(
+            "✅ STK Push sent.\n\n"
+            f"Amount: KSh {PREMIUM_PRICE}\n"
+            f"Phone: {phone}\n\n"
+            "After payment, premium will open automatically for 24 hours."
+        )
+        context.user_data["awaiting_premium_phone"] = False
+        logger.info("STK sent to %s for user %s checkout %s", phone, user_id, checkout_id)
+
+    except Exception as e:
+        logger.exception("Premium payment error")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Payment request failed: {e}")
+
+
+async def handle_mpesa_callback(data: dict, bot):
+    callback = data.get("Body", {}).get("stkCallback", {})
+    result_code = callback.get("ResultCode")
+    result_desc = callback.get("ResultDesc", "")
+    checkout_id = callback.get("CheckoutRequestID")
+
+    pending = load_json(PENDING_FILE, {})
+    payment = pending.get(checkout_id)
+
+    if not payment:
+        logger.warning("Unknown checkout callback: %s", checkout_id)
+        return {"ok": True, "message": "Unknown checkout ignored"}
+
+    user_id = int(payment["user_id"])
+
+    if result_code == 0:
+        expires = activate_premium(user_id, 24)
+        pending.pop(checkout_id, None)
+        save_json(PENDING_FILE, pending)
+
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ *Payment received!*\n\n"
+                "💎 Premium Signals activated for *24 hours*.\n"
+                f"Expires: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+                "Tap /start then 💎 Premium Signals."
+            ),
+            parse_mode="Markdown",
+        )
+        return {"ok": True, "message": "Premium activated"}
+
+    pending.pop(checkout_id, None)
+    save_json(PENDING_FILE, pending)
+
+    await bot.send_message(
+        chat_id=user_id,
+        text=(
+            "❌ *Payment not completed.*\n\n"
+            f"Reason: {result_desc}\n\n"
+            "Premium remains locked. You can try again from 💎 Premium Signals."
+        ),
+        parse_mode="Markdown",
+    )
+    return {"ok": True, "message": "Payment failed/rejected"}
 
 
 def to_okx_symbol(symbol: str):
@@ -194,8 +411,8 @@ def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
 
     r = requests.get(url, params=params, headers=headers, timeout=20)
     r.raise_for_status()
-
     data = r.json()
+
     if data.get("code") != "0":
         raise Exception(data.get("msg", "OKX API Error"))
 
@@ -360,7 +577,7 @@ def detect_order_block(df: pd.DataFrame):
     return "No clear order block"
 
 
-def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
+def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False):
     df = add_indicators(df)
     last = df.iloc[-1]
 
@@ -468,6 +685,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
         stop = min(support, close * 0.985)
         tp1 = close * 1.015
         tp2 = close * 1.030
+        tp3 = close * 1.050
     elif bearish > bullish:
         direction = "SELL / SHORT"
         rating = "🔴 STRONG SELL" if bearish - bullish >= 4 else "🟠 SELL"
@@ -476,6 +694,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
         stop = max(resistance, close * 1.015)
         tp1 = close * 0.985
         tp2 = close * 0.970
+        tp3 = close * 0.950
     else:
         direction = "WAIT"
         rating = "⚪ NEUTRAL"
@@ -484,15 +703,25 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
         stop = support
         tp1 = resistance
         tp2 = resistance
+        tp3 = resistance
 
     confidence = min(92, max(45, 50 + abs(bullish - bearish) * 7))
     risk = "Low" if confidence >= 78 else "Medium" if confidence >= 62 else "High"
-
     mtf_text = "Not available"
     if mtf:
         mtf_text = " | ".join([f"{tf}: {trend}" for tf, trend in mtf.items()])
 
+    vip_header = "💎 *VIP PREMIUM SIGNAL*\n" if vip else ""
+
+    extra_vip = ""
+    if vip:
+        extra_vip = (
+            f"Take Profit 3: `{tp3:.6g}`\n"
+            f"Risk Reward: `Approx 1:{abs((tp2-close)/(close-stop)):.2f}`\n\n"
+        )
+
     return (
+        f"{vip_header}"
         f"📊 *{symbol.upper()} Signal*\n"
         f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
         f"Rating: *{rating}*\n"
@@ -501,7 +730,8 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
         f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
         f"Stop Loss: `{stop:.6g}`\n"
         f"Take Profit 1: `{tp1:.6g}`\n"
-        f"Take Profit 2: `{tp2:.6g}`\n\n"
+        f"Take Profit 2: `{tp2:.6g}`\n"
+        f"{extra_vip}"
         f"Support: `{support:.6g}`\n"
         f"Resistance: `{resistance:.6g}`\n"
         f"Risk: *{risk}*\n"
@@ -519,30 +749,27 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None):
     )
 
 
-async def send_analysis_result(chat_id: int, symbol: str, asset_type: str, context: ContextTypes.DEFAULT_TYPE):
-    symbol = symbol.upper().strip()
-    asset_type = asset_type.lower().strip()
+async def build_crypto_signal(symbol: str, vip=False):
+    df = fetch_crypto_klines(symbol, "15", 150)
+    mtf = {}
+    for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+        try:
+            tf_df = fetch_crypto_klines(symbol, interval, 150)
+            mtf[tf_label] = simple_trend(tf_df)
+        except Exception:
+            mtf[tf_label] = "Unavailable"
+    return generate_signal(df, symbol, mtf=mtf, vip=vip)
 
-    mtf = None
 
+async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, symbol: str, asset_type="crypto", premium=False):
     if asset_type == "crypto":
-        df = fetch_crypto_klines(symbol, "15", 150)
-        mtf = {}
-        for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
-            try:
-                tf_df = fetch_crypto_klines(symbol, interval, 150)
-                mtf[tf_label] = simple_trend(tf_df)
-            except Exception:
-                mtf[tf_label] = "Unavailable"
-
+        signal = await build_crypto_signal(symbol, vip=premium)
     elif asset_type in ["forex", "stock"]:
         df = fetch_twelvedata(symbol, asset_type)
-
+        signal = generate_signal(df, symbol, mtf=None, vip=premium)
     else:
-        await context.bot.send_message(chat_id=chat_id, text="Asset type must be crypto, forex, or stock.")
-        return
+        raise ValueError("Asset type must be crypto, forex, or stock.")
 
-    signal = generate_signal(df, symbol, mtf=mtf)
     await context.bot.send_message(chat_id=chat_id, text=signal, parse_mode="Markdown")
 
 
@@ -550,25 +777,55 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
 
     if not context.args:
-        await update.message.reply_text(
-            "Use:\n"
-            "/analyze BTCUSDT\n"
-            "Or just type:\n"
-            "BTCUSDT\nETHUSDT\nSOLUSDT\n\n"
-            "Forex/stock examples:\n"
-            "/analyze EUR/USD forex\n"
-            "/analyze AAPL stock"
-        )
+        await update.message.reply_text("Use: /analyze BTCUSDT\nOr just send BTCUSDT")
         return
 
-    symbol = context.args[0].upper().strip()
-    asset_type = context.args[1].lower().strip() if len(context.args) > 1 else "crypto"
+    symbol = context.args[0].upper()
+    asset_type = context.args[1].lower() if len(context.args) > 1 else "crypto"
 
     try:
-        await send_analysis_result(update.effective_chat.id, symbol, asset_type, context)
+        await send_analysis(update.effective_chat.id, update.effective_user.id, context, symbol, asset_type, premium=False)
     except Exception as e:
         logger.exception("Analyze error")
         await update.message.reply_text(f"❌ Could not analyze {symbol}. Error: {e}")
+
+
+async def premium_signal(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    active, expires = is_premium(user_id)
+    if not active:
+        await show_premium(chat_id, user_id, context)
+        return
+
+    try:
+        await send_analysis(chat_id, user_id, context, "BTCUSDT", "crypto", premium=True)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Could not generate VIP signal: {e}")
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    text = update.message.text.strip()
+
+    if context.user_data.get("awaiting_premium_phone"):
+        await handle_premium_phone(update, context)
+        return
+
+    clean = text.upper().replace("/", "").replace("-", "").replace(" ", "")
+    known_suffixes = ["USDT", "USD"]
+    looks_like_symbol = clean.isalnum() and (clean.endswith(tuple(known_suffixes)) or clean in ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"])
+
+    if clean in ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"]:
+        clean = clean + "USDT"
+
+    if looks_like_symbol:
+        try:
+            await send_analysis(update.effective_chat.id, update.effective_user.id, context, clean, "crypto", premium=False)
+            return
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not analyze {clean}. Error: {e}")
+            return
+
+    await update.message.reply_text("Send a symbol like BTCUSDT or tap /start for menu.")
 
 
 def scan_news():
@@ -682,6 +939,7 @@ def main():
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(button_click))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.job_queue.run_repeating(scheduled_news_check, interval=NEWS_CHECK_MINUTES * 60, first=20)
 

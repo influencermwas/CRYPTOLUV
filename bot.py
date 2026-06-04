@@ -589,8 +589,7 @@ def format_news_alert(item):
         f"Impact: *High Risk*\n"
         f"Topic: {reasons}\n\n"
         f"Headline: {item['title']}\n\n"
-        "Advice: Avoid blind entries. Wait for confirmation and reduce lot size.\n"
-        f"Source: {item['link']}"
+        "Advice: Avoid blind entries. Wait for confirmation and reduce lot size."
     )
 
 

@@ -15,9 +15,13 @@ from bot import (
     news_command,
     broadcast,
     premium_command,
+    givepremium,
+    vip_history_command,
+    vip_performance_command,
     button_click,
     text_handler,
     scheduled_news_check,
+    maintenance_check,
     handle_mpesa_callback,
 )
 
@@ -37,6 +41,9 @@ telegram_app.add_handler(CommandHandler("analyze", analyze))
 telegram_app.add_handler(CommandHandler("news", news_command))
 telegram_app.add_handler(CommandHandler("broadcast", broadcast))
 telegram_app.add_handler(CommandHandler("premium", premium_command))
+telegram_app.add_handler(CommandHandler("givepremium", givepremium))
+telegram_app.add_handler(CommandHandler("viphistory", vip_history_command))
+telegram_app.add_handler(CommandHandler("vipperformance", vip_performance_command))
 telegram_app.add_handler(CallbackQueryHandler(button_click))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -80,7 +87,10 @@ def set_webhook():
             BotCommand("analyze", "Analyze crypto, forex or stock"),
             BotCommand("news", "Check market news alerts"),
             BotCommand("premium", "Get premium VIP signals"),
+            BotCommand("viphistory", "View VIP signal history"),
+            BotCommand("vipperformance", "View VIP win/loss performance"),
             BotCommand("broadcast", "Admin broadcast message"),
+            BotCommand("givepremium", "Admin activate premium manually"),
         ])
     )
 
@@ -105,9 +115,10 @@ def check_news():
     try:
         fake_context = type("FakeContext", (), {"bot": telegram_app.bot})()
         loop.run_until_complete(scheduled_news_check(fake_context))
-        return jsonify({"ok": True, "message": "News check completed"})
+        loop.run_until_complete(maintenance_check(fake_context))
+        return jsonify({"ok": True, "message": "News + VIP maintenance completed"})
     except Exception as e:
-        logger.exception("News check error")
+        logger.exception("Cron check error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

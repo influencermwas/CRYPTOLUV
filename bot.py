@@ -345,8 +345,7 @@ f"Risk: *{risk}*\n"
 f"Confidence: *{confidence}%*\n\n"
 "Reason:\n- " + "\n- ".join(reasons) +
 "\n\n━━━━━━━━━━━━━━━━━━\n"
-"🔥 *INFLUENCERTECH SIGNALS* 🔥\n"
-"⚠️ This is analysis only, not guaranteed profit."
+"⚠️ This is analysis only, not guaranteed profit.DYOR"
 )
 
 

@@ -24,7 +24,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 NEWS_CHECK_MINUTES = int(os.getenv("NEWS_CHECK_MINUTES", "5") or 5)
 
 PREMIUM_PRICE = int(os.getenv("PREMIUM_PRICE", "35") or 35)
@@ -85,6 +84,9 @@ NEWS_FEEDS = [
 FREE_CONFIDENCE_LIMIT = int(os.getenv("FREE_CONFIDENCE_LIMIT", "80") or 80)
 PREMIUM_MIN_CONFIDENCE = int(os.getenv("PREMIUM_MIN_CONFIDENCE", "80") or 80)
 PREMIUM_DAILY_LIMIT = int(os.getenv("PREMIUM_DAILY_LIMIT", "5") or 5)
+PREMIUM_CRYPTO_SCAN_LIMIT = int(os.getenv("PREMIUM_CRYPTO_SCAN_LIMIT", "12") or 12)
+PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "8") or 8)
+PREMIUM_STOCK_SCAN_LIMIT = int(os.getenv("PREMIUM_STOCK_SCAN_LIMIT", "8") or 8)
 
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@influencertechgc").strip()
 DATA_BOT_URL = os.getenv("DATA_BOT_URL", "https://t.me/INFLUENCERTECHHUB_BOT?start=5352491388").strip()
@@ -709,59 +711,61 @@ def finnhub_resolution(interval="15"):
 
 def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=150):
     """
-    Kept this function name so old bot code does not break.
-    It now uses Finnhub for forex and stocks.
+    Uses Twelve Data for forex and stocks.
+    Crypto still uses OKX through fetch_crypto_klines().
     """
-    if not FINNHUB_API_KEY:
-        raise ValueError("FINNHUB_API_KEY is missing. Add it in Render Environment Variables.")
+    if not TWELVEDATA_API_KEY:
+        raise ValueError("TWELVEDATA_API_KEY is missing. Add it in Render Environment Variables.")
 
-    resolution = "15"
-    if "60" in str(interval) or "1h" in str(interval).lower():
-        resolution = "60"
-    elif "1d" in str(interval).lower() or str(interval).lower() == "d":
-        resolution = "D"
+    asset_type = (asset_type or "stock").lower().strip()
 
-    fin_symbol = finnhub_symbol(symbol, asset_type)
+    if asset_type == "forex":
+        clean = symbol.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
+        if len(clean) == 6:
+            td_symbol = f"{clean[:3]}/{clean[3:]}"
+        else:
+            td_symbol = symbol.upper()
+    else:
+        td_symbol = symbol.upper().replace(" ", "")
 
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    # 15m candles need enough history for EMA200, so use 7 days
-    from_ts = now_ts - (60 * 60 * 24 * 7)
-
-    if resolution == "D":
-        from_ts = now_ts - (60 * 60 * 24 * 365)
-
-    url = "https://finnhub.io/api/v1/stock/candle"
+    url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": fin_symbol,
-        "resolution": resolution,
-        "from": from_ts,
-        "to": now_ts,
-        "token": FINNHUB_API_KEY,
+        "symbol": td_symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY,
     }
 
-    r = requests.get(url, params=params, timeout=20)
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
 
-    if data.get("s") != "ok":
-        raise ValueError(f"Finnhub returned no data for {symbol} ({fin_symbol}): {data}")
+    if data.get("status") == "error":
+        raise ValueError(data.get("message", f"Twelve Data returned an error for {td_symbol}"))
 
-    df = pd.DataFrame({
-        "time": [datetime.fromtimestamp(t, tz=timezone.utc).isoformat() for t in data.get("t", [])],
-        "open": data["o"],
-        "high": data["h"],
-        "low": data["l"],
-        "close": data["c"],
-        "volume": data.get("v", [0] * len(data["c"])),
-    })
+    values = data.get("values", [])
+    if not values:
+        raise ValueError(f"No Twelve Data candle data returned for {td_symbol}")
 
+    rows = []
+    for item in reversed(values):
+        rows.append({
+            "time": item.get("datetime"),
+            "open": float(item["open"]),
+            "high": float(item["high"]),
+            "low": float(item["low"]),
+            "close": float(item["close"]),
+            "volume": float(item.get("volume") or 0),
+        })
+
+    df = pd.DataFrame(rows)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna().tail(outputsize).reset_index(drop=True)
 
     if len(df) < 50:
-        raise ValueError(f"Not enough Finnhub candle data for {symbol}")
+        raise ValueError(f"Not enough Twelve Data candle data for {td_symbol}")
 
     return df
 
@@ -1370,7 +1374,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
 
     candidates = []
 
-    for symbol in CRYPTO_WATCHLIST:
+    for symbol in CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT]:
         try:
             meta = await score_symbol(symbol, "crypto")
             if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
@@ -1379,8 +1383,8 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         except Exception as e:
             logger.warning("Crypto scan failed for %s: %s", symbol, e)
 
-    if FINNHUB_API_KEY:
-        for symbol in FOREX_WATCHLIST:
+    if TWELVEDATA_API_KEY:
+        for symbol in FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT]:
             try:
                 meta = await score_symbol(symbol, "forex")
                 if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
@@ -1389,7 +1393,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
             except Exception as e:
                 logger.warning("Forex scan failed for %s: %s", symbol, e)
 
-        for symbol in STOCK_WATCHLIST:
+        for symbol in STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT]:
             try:
                 meta = await score_symbol(symbol, "stock")
                 if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":

@@ -87,6 +87,12 @@ PREMIUM_DAILY_LIMIT = int(os.getenv("PREMIUM_DAILY_LIMIT", "5") or 5)
 PREMIUM_CRYPTO_SCAN_LIMIT = int(os.getenv("PREMIUM_CRYPTO_SCAN_LIMIT", "12") or 12)
 PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "8") or 8)
 PREMIUM_STOCK_SCAN_LIMIT = int(os.getenv("PREMIUM_STOCK_SCAN_LIMIT", "8") or 8)
+VIP_SCAN_COOLDOWN_MINUTES = int(os.getenv("VIP_SCAN_COOLDOWN_MINUTES", "10") or 10)
+VIP_MONITOR_LIMIT = int(os.getenv("VIP_MONITOR_LIMIT", "50") or 50)
+AUTO_DAILY_VIP_SIGNALS = os.getenv("AUTO_DAILY_VIP_SIGNALS", "0").strip() == "1"
+DAILY_VIP_SIGNAL_HOUR = int(os.getenv("DAILY_VIP_SIGNAL_HOUR", "8") or 8)
+COOLDOWN_FILE = "vip_cooldowns.json"
+
 
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@influencertechgc").strip()
 DATA_BOT_URL = os.getenv("DATA_BOT_URL", "https://t.me/INFLUENCERTECHHUB_BOT?start=5352491388").strip()
@@ -1205,17 +1211,47 @@ def evaluate_signal_outcome(row: dict):
 async def update_vip_results(context: ContextTypes.DEFAULT_TYPE = None):
     if not USE_SUPABASE:
         return
-    rows = sb_get(VIP_HISTORY_TABLE, {"status": "eq.RUNNING", "select": "*", "limit": "100"}) or []
+
+    rows = sb_get(VIP_HISTORY_TABLE, {
+        "status": "eq.RUNNING",
+        "select": "*",
+        "limit": str(VIP_MONITOR_LIMIT),
+    }) or []
+
     for row in rows:
         result = evaluate_signal_outcome(row)
         if not result:
             continue
+
         status, profit_percent = result
         sb_patch(VIP_HISTORY_TABLE, {"id": f"eq.{row['id']}"}, {
             "status": status,
             "profit_percent": profit_percent,
             "updated_at": now_utc().isoformat(),
         })
+
+        if context is not None:
+            try:
+                user_id = int(row.get("user_id"))
+                symbol = row.get("symbol", "SIGNAL")
+                direction = row.get("direction", "")
+                if status == "WIN":
+                    msg = (
+                        f"🎯 *VIP Signal Update*\n\n"
+                        f"✅ `{symbol}` TP hit!\n"
+                        f"Direction: *{direction}*\n"
+                        f"Result: `{profit_percent:+.2f}%`"
+                    )
+                else:
+                    msg = (
+                        f"🛑 *VIP Signal Update*\n\n"
+                        f"❌ `{symbol}` SL hit.\n"
+                        f"Direction: *{direction}*\n"
+                        f"Result: `{profit_percent:+.2f}%`"
+                    )
+                await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning("Failed to notify VIP result: %s", e)
 
 
 async def send_vip_history(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -1361,11 +1397,40 @@ async def maintenance_check(context: ContextTypes.DEFAULT_TYPE):
     await update_vip_results(context)
     await premium_expiry_reminder_check(context)
 
+
+def vip_cooldown_remaining(user_id: int) -> int:
+    cooldowns = load_json(COOLDOWN_FILE, {})
+    last_raw = cooldowns.get(str(user_id))
+    last_dt = parse_dt(last_raw)
+    if not last_dt:
+        return 0
+    elapsed = now_utc() - last_dt
+    wait_seconds = VIP_SCAN_COOLDOWN_MINUTES * 60 - int(elapsed.total_seconds())
+    return max(0, wait_seconds)
+
+
+def mark_vip_scan_used(user_id: int):
+    cooldowns = load_json(COOLDOWN_FILE, {})
+    cooldowns[str(user_id)] = now_utc().isoformat()
+    save_json(COOLDOWN_FILE, cooldowns)
+
+
 async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
     if not active:
         await show_premium(chat_id, user_id, context)
         return
+
+    remaining = vip_cooldown_remaining(user_id)
+    if remaining > 0:
+        minutes = max(1, remaining // 60)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ Please wait {minutes} minute(s) before requesting another VIP scan."
+        )
+        return
+
+    mark_vip_scan_used(user_id)
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1634,6 +1699,42 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {sent} users.")
 
 
+async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    users = load_json(USERS_FILE, [])
+    premium = load_json(PREMIUM_FILE, {})
+
+    running = wins = losses = 0
+    if USE_SUPABASE:
+        rows = sb_get(VIP_HISTORY_TABLE, {"select": "status", "limit": "1000"}) or []
+        running = sum(1 for r in rows if r.get("status") == "RUNNING")
+        wins = sum(1 for r in rows if r.get("status") == "WIN")
+        losses = sum(1 for r in rows if r.get("status") == "LOSS")
+
+    closed = wins + losses
+    win_rate = round((wins / closed) * 100, 1) if closed else 0
+
+    text = (
+        "📊 *ADMIN STATS*\n\n"
+        f"👥 Users: *{len(users)}*\n"
+        f"💎 Premium Users: *{len(premium)}*\n"
+        f"📈 Crypto Scan Limit: *{PREMIUM_CRYPTO_SCAN_LIMIT}*\n"
+        f"💱 Forex Scan Limit: *{PREMIUM_FOREX_SCAN_LIMIT}*\n"
+        f"🏛 Stock Scan Limit: *{PREMIUM_STOCK_SCAN_LIMIT}*\n"
+        f"🎯 Daily VIP Limit: *{PREMIUM_DAILY_LIMIT}*\n"
+        f"⏳ VIP Cooldown: *{VIP_SCAN_COOLDOWN_MINUTES} min*\n\n"
+        f"🏃 Running Signals: *{running}*\n"
+        f"✅ Wins: *{wins}*\n"
+        f"❌ Losses: *{losses}*\n"
+        f"📌 Win Rate: *{win_rate}%*"
+    )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing. Add it in .env or Render Environment Variables.")
@@ -1647,6 +1748,7 @@ def main():
     app.add_handler(CommandHandler("givepremium", givepremium))
     app.add_handler(CommandHandler("viphistory", vip_history_command))
     app.add_handler(CommandHandler("vipperformance", vip_performance_command))
+    app.add_handler(CommandHandler("adminstats", adminstats))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 

@@ -18,13 +18,18 @@ from bot import (
     givepremium,
     vip_history_command,
     vip_performance_command,
-    adminstats,
     button_click,
     text_handler,
     scheduled_news_check,
     maintenance_check,
     handle_mpesa_callback,
 )
+
+try:
+    from bot import adminstats
+except ImportError:
+    adminstats = None
+
 
 load_dotenv()
 
@@ -49,7 +54,8 @@ telegram_app.add_handler(CommandHandler("premium", premium_command))
 telegram_app.add_handler(CommandHandler("givepremium", givepremium))
 telegram_app.add_handler(CommandHandler("viphistory", vip_history_command))
 telegram_app.add_handler(CommandHandler("vipperformance", vip_performance_command))
-telegram_app.add_handler(CommandHandler("adminstats", adminstats))
+if adminstats is not None:
+    telegram_app.add_handler(CommandHandler("adminstats", adminstats))
 telegram_app.add_handler(CallbackQueryHandler(button_click))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 

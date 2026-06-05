@@ -18,6 +18,7 @@ from bot import (
     givepremium,
     vip_history_command,
     vip_performance_command,
+    adminstats,
     button_click,
     text_handler,
     scheduled_news_check,
@@ -27,6 +28,10 @@ from bot import (
 
 load_dotenv()
 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
@@ -44,6 +49,7 @@ telegram_app.add_handler(CommandHandler("premium", premium_command))
 telegram_app.add_handler(CommandHandler("givepremium", givepremium))
 telegram_app.add_handler(CommandHandler("viphistory", vip_history_command))
 telegram_app.add_handler(CommandHandler("vipperformance", vip_performance_command))
+telegram_app.add_handler(CommandHandler("adminstats", adminstats))
 telegram_app.add_handler(CallbackQueryHandler(button_click))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -81,22 +87,28 @@ def set_webhook():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     response = requests.post(url, json={"url": webhook_url}, timeout=20)
 
-    loop.run_until_complete(
-        telegram_app.bot.set_my_commands([
-            BotCommand("start", "Open main menu"),
-            BotCommand("analyze", "Analyze crypto, forex or stock"),
-            BotCommand("news", "Check market news alerts"),
-            BotCommand("premium", "Get premium VIP signals"),
-            BotCommand("viphistory", "View VIP signal history"),
-            BotCommand("vipperformance", "View VIP win/loss performance"),
-            BotCommand("broadcast", "Admin broadcast message"),
-            BotCommand("givepremium", "Admin activate premium manually"),
-        ])
-    )
+    try:
+        loop.run_until_complete(
+            telegram_app.bot.set_my_commands([
+                BotCommand("start", "Open main menu"),
+                BotCommand("analyze", "Analyze crypto, forex or stock"),
+                BotCommand("news", "Check market news alerts"),
+                BotCommand("premium", "Get premium VIP signals"),
+                BotCommand("viphistory", "View VIP signal history"),
+                BotCommand("vipperformance", "View VIP win/loss performance"),
+                BotCommand("adminstats", "Admin dashboard"),
+                BotCommand("broadcast", "Admin broadcast message"),
+                BotCommand("givepremium", "Admin activate premium manually"),
+            ])
+        )
+        menu_status = "Telegram command menu added successfully"
+    except Exception as e:
+        logger.warning("set_my_commands failed: %s", e)
+        menu_status = f"Webhook set, but command menu update failed: {e}"
 
     return jsonify({
         "webhook": response.json(),
-        "menu": "Telegram command menu added successfully"
+        "menu": menu_status,
     })
 
 

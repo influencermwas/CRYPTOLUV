@@ -40,6 +40,9 @@ USERS_FILE = "users.json"
 NEWS_FILE = "seen_news.json"
 PREMIUM_FILE = "premium_users.json"
 PENDING_FILE = "pending_payments.json"
+MT5_USERS_FILE = "mt5_users.json"
+MT5_ORDERS_FILE = "mt5_orders.json"
+AUTO_VIP_FILE = "auto_vip_last_sent.json"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")).strip()
@@ -82,11 +85,15 @@ NEWS_FEEDS = [
 ]
 
 FREE_CONFIDENCE_LIMIT = int(os.getenv("FREE_CONFIDENCE_LIMIT", "80") or 80)
-PREMIUM_MIN_CONFIDENCE = int(os.getenv("PREMIUM_MIN_CONFIDENCE", "80") or 80)
+PREMIUM_MIN_CONFIDENCE = int(os.getenv("PREMIUM_MIN_CONFIDENCE", "79") or 79)
 PREMIUM_DAILY_LIMIT = int(os.getenv("PREMIUM_DAILY_LIMIT", "5") or 5)
 PREMIUM_CRYPTO_SCAN_LIMIT = int(os.getenv("PREMIUM_CRYPTO_SCAN_LIMIT", "12") or 12)
 PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "8") or 8)
 PREMIUM_STOCK_SCAN_LIMIT = int(os.getenv("PREMIUM_STOCK_SCAN_LIMIT", "8") or 8)
+VIP_LEVERAGE = float(os.getenv("VIP_LEVERAGE", "10") or 10)
+AUTO_VIP_SIGNALS_ENABLED = os.getenv("AUTO_VIP_SIGNALS_ENABLED", "1").strip() == "1"
+AUTO_VIP_SCAN_MINUTES = int(os.getenv("AUTO_VIP_SCAN_MINUTES", "60") or 60)
+MAX_ACTIVE_MT5_ORDERS = int(os.getenv("MAX_ACTIVE_MT5_ORDERS", "4") or 4)
 
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@influencertechgc").strip()
 DATA_BOT_URL = os.getenv("DATA_BOT_URL", "https://t.me/INFLUENCERTECHHUB_BOT?start=5352491388").strip()
@@ -127,6 +134,110 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def clean_symbol(symbol: str):
+    return str(symbol or "").upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
+
+
+def make_order_id(user_id: int, symbol: str):
+    ts = now_utc().strftime("%Y%m%d%H%M%S")
+    return f"VIP-{user_id}-{clean_symbol(symbol)}-{ts}"
+
+
+def get_mt5_users():
+    return load_json(MT5_USERS_FILE, {})
+
+
+def save_mt5_users(data):
+    save_json(MT5_USERS_FILE, data)
+
+
+def get_mt5_orders():
+    return load_json(MT5_ORDERS_FILE, [])
+
+
+def save_mt5_orders(data):
+    save_json(MT5_ORDERS_FILE, data)
+
+
+def active_mt5_order_count(user_id: int):
+    active_statuses = {"PENDING_TO_BRIDGE", "PLACED", "OPEN", "PARTIAL"}
+    orders = get_mt5_orders()
+    return sum(1 for o in orders if str(o.get("user_id")) == str(user_id) and o.get("status") in active_statuses)
+
+
+def get_mt5_profile(user_id: int):
+    return get_mt5_users().get(str(user_id), {})
+
+
+def is_mt5_linked(user_id: int):
+    profile = get_mt5_profile(user_id)
+    return bool(profile.get("enabled") and profile.get("bridge_code"))
+
+
+def mt5_lot_size(user_id: int):
+    profile = get_mt5_profile(user_id)
+    try:
+        lot = float(profile.get("lot_size", 0.01))
+    except Exception:
+        lot = 0.01
+    return max(0.01, lot)
+
+
+def leverage_pnl_percent(direction: str, entry: float, target: float):
+    if not entry:
+        return 0.0
+    if "SELL" in direction:
+        move_pct = ((entry - target) / entry) * 100
+    else:
+        move_pct = ((target - entry) / entry) * 100
+    return move_pct * VIP_LEVERAGE
+
+
+def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
+    """Queue a VIP signal for the user's laptop MT5 bridge. The laptop bridge pulls these orders."""
+    if not is_mt5_linked(user_id):
+        return {"queued": False, "reason": "MT5 not linked"}
+
+    active_count = active_mt5_order_count(user_id)
+    if active_count >= MAX_ACTIVE_MT5_ORDERS:
+        return {"queued": False, "reason": f"Maximum {MAX_ACTIVE_MT5_ORDERS} active MT5 orders reached"}
+
+    profile = get_mt5_profile(user_id)
+    direction = meta.get("direction", "")
+    entry = (float(meta.get("entry_low")) + float(meta.get("entry_high"))) / 2
+
+    order = {
+        "order_id": make_order_id(user_id, meta.get("symbol")),
+        "user_id": str(user_id),
+        "bridge_code": profile.get("bridge_code"),
+        "asset_type": asset_type,
+        "symbol": meta.get("symbol"),
+        "direction": direction,
+        "order_type": "BUY_LIMIT" if "BUY" in direction else "SELL_LIMIT" if "SELL" in direction else "NONE",
+        "lot_size": mt5_lot_size(user_id),
+        "entry_price": entry,
+        "entry_low": meta.get("entry_low"),
+        "entry_high": meta.get("entry_high"),
+        "stop_loss": meta.get("stop_loss"),
+        "tp1": meta.get("tp1"),
+        "tp2": meta.get("tp2"),
+        "tp3": meta.get("tp3"),
+        "leverage_used_for_display": VIP_LEVERAGE,
+        "tp1_pnl_percent": round(leverage_pnl_percent(direction, entry, float(meta.get("tp1"))), 2),
+        "tp2_pnl_percent": round(leverage_pnl_percent(direction, entry, float(meta.get("tp2"))), 2),
+        "tp3_pnl_percent": round(leverage_pnl_percent(direction, entry, float(meta.get("tp3"))), 2),
+        "sl_pnl_percent": round(leverage_pnl_percent(direction, entry, float(meta.get("stop_loss"))), 2),
+        "confidence": meta.get("confidence"),
+        "status": "PENDING_TO_BRIDGE",
+        "created_at": now_utc().isoformat(),
+        "updated_at": now_utc().isoformat(),
+    }
+    orders = get_mt5_orders()
+    orders.append(order)
+    save_mt5_orders(orders[-1000:])
+    return {"queued": True, "order": order}
 
 
 def sb_headers():
@@ -1030,6 +1141,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
             "tp3": tp3,
             "support": support,
             "resistance": resistance,
+            "leverage_used_for_display": VIP_LEVERAGE,
             "created_at": now_utc().isoformat(),
         }
 
@@ -1065,9 +1177,19 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
 
     extra_vip = ""
     if vip:
+        entry_mid = (entry_low + entry_high) / 2
+        tp1_pnl = leverage_pnl_percent(direction, entry_mid, tp1)
+        tp2_pnl = leverage_pnl_percent(direction, entry_mid, tp2)
+        tp3_pnl = leverage_pnl_percent(direction, entry_mid, tp3)
+        sl_pnl = leverage_pnl_percent(direction, entry_mid, stop)
         extra_vip = (
             f"Take Profit 3: `{tp3:.6g}`\n"
             f"Risk Reward: `Approx 1:{abs((tp2-close)/(close-stop)):.2f}`\n\n"
+            f"📈 *{VIP_LEVERAGE:g}x Futures PnL Projection*\n"
+            f"TP1 Profit: `{tp1_pnl:+.2f}%`\n"
+            f"TP2 Profit: `{tp2_pnl:+.2f}%`\n"
+            f"TP3 Profit: `{tp3_pnl:+.2f}%`\n"
+            f"SL Risk: `{sl_pnl:+.2f}%`\n\n"
         )
 
     return (
@@ -1357,9 +1479,56 @@ async def premium_expiry_reminder_check(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Premium reminder failed for %s: %s", user_id, e)
 
 
+def get_active_premium_user_ids():
+    ids = set()
+    if USE_SUPABASE:
+        rows = sb_get(PREMIUM_TABLE, {"select": "user_id,expires_at", "limit": "1000"}) or []
+        for row in rows:
+            expires = parse_dt(row.get("expires_at"))
+            if expires and expires > now_utc():
+                try:
+                    ids.add(int(row.get("user_id")))
+                except Exception:
+                    pass
+    local = load_json(PREMIUM_FILE, {})
+    for uid, expires_raw in local.items():
+        expires = parse_dt(expires_raw)
+        if expires and expires > now_utc():
+            try:
+                ids.add(int(uid))
+            except Exception:
+                pass
+    return sorted(ids)
+
+
+async def automatic_vip_signal_check(context: ContextTypes.DEFAULT_TYPE):
+    if not AUTO_VIP_SIGNALS_ENABLED:
+        return
+    users = get_active_premium_user_ids()
+    if not users:
+        return
+    last_sent = load_json(AUTO_VIP_FILE, {})
+    current = now_utc()
+    for user_id in users:
+        last = parse_dt(last_sent.get(str(user_id)))
+        if last and current - last < timedelta(minutes=AUTO_VIP_SCAN_MINUTES):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="💎 Automatic VIP scan running. You do not need to press Get VIP Signals.",
+            )
+            await premium_signals(user_id, user_id, context)
+            last_sent[str(user_id)] = current.isoformat()
+            save_json(AUTO_VIP_FILE, last_sent)
+        except Exception as e:
+            logger.warning("Automatic VIP scan failed for %s: %s", user_id, e)
+
+
 async def maintenance_check(context: ContextTypes.DEFAULT_TYPE):
     await update_vip_results(context)
     await premium_expiry_reminder_check(context)
+    await automatic_vip_signal_check(context)
 
 async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
@@ -1408,9 +1577,9 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "💎 *VIP Scan Complete*\\n\\n"
-                "No A-grade premium setup found right now.\\n"
-                "This is good risk control — we do not force weak trades.\\n\\n"
+                "💎 *VIP Scan Complete*\n\n"
+                "No A-grade premium setup found right now.\n"
+                "This is good risk control — we do not force weak trades.\n\n"
                 "Try again later."
             ),
             parse_mode="Markdown",
@@ -1462,6 +1631,28 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
     await context.bot.send_message(chat_id=chat_id, text=signal, parse_mode="Markdown")
     if premium and meta:
         save_vip_signal(user_id, asset_type, meta)
+        mt5_result = queue_mt5_pending_order(user_id, asset_type, meta)
+        if mt5_result.get("queued"):
+            order = mt5_result["order"]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🤖 *MT5 Auto Order Queued*\n\n"
+                    f"Symbol: `{order['symbol']}`\n"
+                    f"Type: `{order['order_type']}`\n"
+                    f"Lot Size: `{order['lot_size']}`\n"
+                    f"Entry: `{order['entry_price']:.6g}`\n"
+                    f"SL: `{float(order['stop_loss']):.6g}`\n"
+                    f"TP1: `{float(order['tp1']):.6g}`\n\n"
+                    "Keep your laptop, MT5, and MT5 Bridge running for execution."
+                ),
+                parse_mode="Markdown",
+            )
+        elif is_mt5_linked(user_id):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ MT5 auto-order skipped: {mt5_result.get('reason')}",
+            )
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1483,6 +1674,79 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Analyze error")
         await update.message.reply_text(f"❌ Could not analyze {symbol}. Error: {e}")
+
+
+async def setlot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Use: /setlot 0.01")
+        return
+    try:
+        lot = float(context.args[0])
+        if lot <= 0:
+            raise ValueError("Lot size must be above 0")
+        users = get_mt5_users()
+        profile = users.get(str(update.effective_user.id), {})
+        profile["lot_size"] = lot
+        profile.setdefault("enabled", False)
+        profile["updated_at"] = now_utc().isoformat()
+        users[str(update.effective_user.id)] = profile
+        save_mt5_users(users)
+        await update.message.reply_text(f"✅ MT5 lot size saved: {lot}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid lot size. Example: /setlot 0.01\nError: {e}")
+
+
+async def mt5link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    users = get_mt5_users()
+    uid = str(update.effective_user.id)
+    profile = users.get(uid, {})
+    code = profile.get("bridge_code") or f"BRIDGE-{uid[-6:]}-{now_utc().strftime('%H%M%S')}"
+    profile["bridge_code"] = code
+    profile["enabled"] = True
+    profile.setdefault("lot_size", 0.01)
+    profile["updated_at"] = now_utc().isoformat()
+    users[uid] = profile
+    save_mt5_users(users)
+    await update.message.reply_text(
+        "✅ *MT5 Bridge Enabled*\n\n"
+        f"Bridge Code: `{code}`\n"
+        f"Lot Size: `{profile.get('lot_size', 0.01)}`\n"
+        f"Max Active Orders: `{MAX_ACTIVE_MT5_ORDERS}`\n\n"
+        "Keep your laptop, MT5, and MT5 Bridge running.\n"
+        "Use /setlot 0.01 to change lot size.\n"
+        "Use /mt5off to disable auto orders.",
+        parse_mode="Markdown",
+    )
+
+
+async def mt5status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    profile = get_mt5_profile(update.effective_user.id)
+    active_count = active_mt5_order_count(update.effective_user.id)
+    if not profile:
+        await update.message.reply_text("MT5 Bridge is not linked. Use /mt5link first.")
+        return
+    await update.message.reply_text(
+        "🤖 *MT5 Status*\n\n"
+        f"Enabled: `{profile.get('enabled', False)}`\n"
+        f"Bridge Code: `{profile.get('bridge_code', 'None')}`\n"
+        f"Lot Size: `{profile.get('lot_size', 0.01)}`\n"
+        f"Active/Pending Orders: `{active_count}/{MAX_ACTIVE_MT5_ORDERS}`",
+        parse_mode="Markdown",
+    )
+
+
+async def mt5off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = get_mt5_users()
+    uid = str(update.effective_user.id)
+    profile = users.get(uid, {})
+    profile["enabled"] = False
+    profile["updated_at"] = now_utc().isoformat()
+    users[uid] = profile
+    save_mt5_users(users)
+    await update.message.reply_text("✅ MT5 auto orders disabled. VIP signals will still be sent normally.")
 
 
 async def premium_signal(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -1634,6 +1898,43 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast sent to {sent} users.")
 
 
+async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    users = load_json(USERS_FILE, [])
+    premium = load_json(PREMIUM_FILE, {})
+
+    running = wins = losses = 0
+    if USE_SUPABASE:
+        rows = sb_get(VIP_HISTORY_TABLE, {"select": "status", "limit": "1000"}) or []
+        running = sum(1 for r in rows if r.get("status") == "RUNNING")
+        wins = sum(1 for r in rows if r.get("status") == "WIN")
+        losses = sum(1 for r in rows if r.get("status") == "LOSS")
+    total_closed = wins + losses
+    win_rate = round((wins / total_closed) * 100, 1) if total_closed else 0
+
+    text = (
+        "📊 *ADMIN STATS*\n\n"
+        f"👥 Users: *{len(users)}*\n"
+        f"💎 Premium Users: *{len(premium)}*\n"
+        f"📈 Crypto Scan Limit: *{PREMIUM_CRYPTO_SCAN_LIMIT}*\n"
+        f"💱 Forex Scan Limit: *{PREMIUM_FOREX_SCAN_LIMIT}*\n"
+        f"🏛 Stock Scan Limit: *{PREMIUM_STOCK_SCAN_LIMIT}*\n"
+        f"🎯 Daily VIP Limit: *{PREMIUM_DAILY_LIMIT}*\n"
+        f"📊 VIP Min Confidence: *{PREMIUM_MIN_CONFIDENCE}%*\n"
+        f"⚡ VIP Leverage Display: *{VIP_LEVERAGE:g}x*\n"
+        f"🤖 Auto VIP: *{AUTO_VIP_SIGNALS_ENABLED}* every *{AUTO_VIP_SCAN_MINUTES} min*\n"
+        f"🧾 Max MT5 Orders/User: *{MAX_ACTIVE_MT5_ORDERS}*\n\n"
+        f"🏃 Running Signals: *{running}*\n"
+        f"✅ Wins: *{wins}*\n"
+        f"❌ Losses: *{losses}*\n"
+        f"📌 Win Rate: *{win_rate}%*"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing. Add it in .env or Render Environment Variables.")
@@ -1647,6 +1948,11 @@ def main():
     app.add_handler(CommandHandler("givepremium", givepremium))
     app.add_handler(CommandHandler("viphistory", vip_history_command))
     app.add_handler(CommandHandler("vipperformance", vip_performance_command))
+    app.add_handler(CommandHandler("adminstats", adminstats))
+    app.add_handler(CommandHandler("setlot", setlot))
+    app.add_handler(CommandHandler("mt5link", mt5link))
+    app.add_handler(CommandHandler("mt5status", mt5status))
+    app.add_handler(CommandHandler("mt5off", mt5off))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 

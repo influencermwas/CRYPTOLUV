@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
+import yfinance as yf
 import feedparser
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -44,8 +45,9 @@ PENDING_FILE = "pending_payments.json"
 MT5_USERS_FILE = "mt5_users.json"
 MT5_ORDERS_FILE = "mt5_orders.json"
 AUTO_VIP_FILE = "auto_vip_last_sent.json"
-CACHE_FILE = "market_cache.json"
+MARKET_CACHE_FILE = "market_cache.json"
 CACHE_MINUTES = int(os.getenv("CACHE_MINUTES", "15") or 15)
+A_PLUS_MIN_CONFIDENCE = int(os.getenv("A_PLUS_MIN_CONFIDENCE", "85") or 85)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")).strip()
@@ -120,6 +122,25 @@ STOCK_WATCHLIST = [
     "AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "AMD", "NFLX",
     "PLTR", "COIN", "MSTR", "SMCI", "AVGO", "ARM", "BABA", "JPM", "SPY", "QQQ",
 ]
+
+YAHOO_SYMBOL_MAP = {
+    "XAUUSD": "GC=F",
+    "XAGUSD": "SI=F",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "USDCAD": "CAD=X",
+    "AUDUSD": "AUDUSD=X",
+    "NZDUSD": "NZDUSD=X",
+    "USDCHF": "CHF=X",
+    "GBPJPY": "GBPJPY=X",
+    "EURJPY": "EURJPY=X",
+    "EURGBP": "EURGBP=X",
+    "EURAUD": "EURAUD=X",
+    "AUDJPY": "AUDJPY=X",
+    "CADJPY": "CADJPY=X",
+    "CHFJPY": "CHFJPY=X",
+}
 
 
 def now_utc():
@@ -199,9 +220,9 @@ def leverage_pnl_percent(direction: str, entry: float, target: float):
 
 
 def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
-    """Queue a VIP signal for the MT5 EA. The EA pulls these orders from app.py."""
+    """Queue a VIP signal for the user's laptop MT5 bridge. The laptop bridge pulls these orders."""
     if not is_mt5_linked(user_id):
-        return {"queued": False, "reason": "MT5 EA not linked"}
+        return {"queued": False, "reason": "MT5 not linked"}
 
     active_count = active_mt5_order_count(user_id)
     if active_count >= MAX_ACTIVE_MT5_ORDERS:
@@ -826,97 +847,101 @@ def finnhub_resolution(interval="15"):
     return "15"
 
 
-def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=150):
-    """
-    Uses Twelve Data for forex and stocks with local caching.
-    Cache reduces 429 rate-limit errors and stops repeated requests for the same symbol.
-    """
-    if not TWELVEDATA_API_KEY:
-        raise ValueError("TWELVEDATA_API_KEY is missing. Add it in Render Environment Variables.")
 
-    asset_type = (asset_type or "stock").lower().strip()
-    clean_symbol_key = clean_symbol(symbol)
-    cache_key = f"{clean_symbol_key}_{asset_type}_{interval}_{outputsize}"
+def yahoo_symbol(symbol: str):
+    clean = clean_symbol(symbol)
+    return YAHOO_SYMBOL_MAP.get(clean, clean)
 
-    cache = load_json(CACHE_FILE, {})
-    cached = cache.get(cache_key)
-    if cached:
-        saved_at = parse_dt(cached.get("saved_at"))
-        if saved_at and now_utc() - saved_at < timedelta(minutes=CACHE_MINUTES):
-            df = pd.DataFrame(cached.get("rows", []))
-            if not df.empty:
-                for col in ["open", "high", "low", "close", "volume"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                return df.dropna().reset_index(drop=True)
 
-    if asset_type == "forex":
-        clean = symbol.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
-        td_symbol = f"{clean[:3]}/{clean[3:]}" if len(clean) == 6 else symbol.upper()
-    else:
-        td_symbol = symbol.upper().replace(" ", "")
+def _normalize_yahoo_df(raw: pd.DataFrame, candles: int):
+    if raw is None or raw.empty:
+        raise ValueError("No market data returned from Yahoo Finance")
 
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": td_symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY,
-    }
+    # yfinance may return MultiIndex columns depending on version/symbol.
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
 
-    r = requests.get(url, params=params, timeout=30)
+    raw = raw.reset_index()
+    colmap = {str(c).lower(): c for c in raw.columns}
 
-    if r.status_code == 429:
-        if cached and cached.get("rows"):
-            df = pd.DataFrame(cached["rows"])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df.dropna().reset_index(drop=True)
-        raise ValueError("TwelveData limit reached. Try again later or reduce Forex/Stock scan limits.")
+    def pick(*names):
+        for name in names:
+            if name.lower() in colmap:
+                return colmap[name.lower()]
+        return None
 
-    r.raise_for_status()
-    data = r.json()
+    time_col = pick("Datetime", "Date", "index")
+    open_col = pick("Open")
+    high_col = pick("High")
+    low_col = pick("Low")
+    close_col = pick("Close", "Adj Close")
+    volume_col = pick("Volume")
 
-    if data.get("status") == "error":
-        msg = data.get("message", f"Twelve Data returned an error for {td_symbol}")
-        if "limit" in msg.lower() and cached and cached.get("rows"):
-            df = pd.DataFrame(cached["rows"])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df.dropna().reset_index(drop=True)
-        raise ValueError(msg)
+    if not all([open_col, high_col, low_col, close_col]):
+        raise ValueError("Yahoo data missing OHLC columns")
 
-    values = data.get("values", [])
-    if not values:
-        raise ValueError(f"No Twelve Data candle data returned for {td_symbol}")
+    df = pd.DataFrame({
+        "time": raw[time_col].astype(str) if time_col else raw.index.astype(str),
+        "open": raw[open_col],
+        "high": raw[high_col],
+        "low": raw[low_col],
+        "close": raw[close_col],
+        "volume": raw[volume_col] if volume_col else 0,
+    })
 
-    rows = []
-    for item in reversed(values):
-        rows.append({
-            "time": item.get("datetime"),
-            "open": float(item["open"]),
-            "high": float(item["high"]),
-            "low": float(item["low"]),
-            "close": float(item["close"]),
-            "volume": float(item.get("volume") or 0),
-        })
-
-    df = pd.DataFrame(rows)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna().tail(outputsize).reset_index(drop=True)
-
+    df = df.dropna(subset=["open", "high", "low", "close"]).tail(candles).reset_index(drop=True)
     if len(df) < 50:
-        raise ValueError(f"Not enough Twelve Data candle data for {td_symbol}")
+        raise ValueError("Not enough Yahoo Finance candle data")
+    return df
+
+
+def fetch_yahoo_klines(symbol: str, asset_type: str, interval="15m", outputsize=150):
+    """Free Yahoo Finance data for forex, gold, silver and stocks. No API key needed."""
+    clean = clean_symbol(symbol)
+    yf_symbol = yahoo_symbol(clean)
+    cache = load_json(MARKET_CACHE_FILE, {})
+    cache_key = f"yahoo:{clean}:{asset_type}:{interval}:{outputsize}"
+    cached = cache.get(cache_key)
+
+    if cached:
+        saved_at = parse_dt(cached.get("saved_at"))
+        if saved_at and now_utc() - saved_at < timedelta(minutes=CACHE_MINUTES):
+            return pd.DataFrame(cached.get("rows", []))
+
+    period = "30d" if interval in ["15m", "30m", "60m", "1h"] else "1y"
+
+    try:
+        raw = yf.download(
+            yf_symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        df = _normalize_yahoo_df(raw, outputsize)
+    except Exception as e:
+        if cached and cached.get("rows"):
+            logger.warning("Yahoo fetch failed for %s, using cache: %s", clean, e)
+            return pd.DataFrame(cached.get("rows", []))
+        raise ValueError(f"Yahoo Finance data failed for {clean}: {e}")
 
     cache[cache_key] = {
         "saved_at": now_utc().isoformat(),
         "rows": df.to_dict("records"),
     }
-    save_json(CACHE_FILE, cache)
-
+    save_json(MARKET_CACHE_FILE, cache)
     return df
 
+
+# Backward-compatible name. Existing code can still call fetch_twelvedata(),
+# but it now uses Yahoo Finance instead of TwelveData.
+def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=150):
+    yahoo_interval = "15m" if interval in ["15min", "15"] else interval
+    return fetch_yahoo_klines(symbol, asset_type, yahoo_interval, outputsize)
 
 def add_indicators(df: pd.DataFrame):
     df = df.copy()
@@ -934,12 +959,6 @@ def add_indicators(df: pd.DataFrame):
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-
-    prev_close = df["close"].shift(1)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    df["atr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
     return df
 
 
@@ -953,60 +972,90 @@ def simple_trend(df: pd.DataFrame):
     return "Mixed"
 
 
-def current_session_ok(asset_type: str):
-    hour = now_utc().hour
-    asset_type = (asset_type or "").lower()
-    if asset_type == "stock":
-        return 13 <= hour <= 21
-    if asset_type == "forex":
-        return 7 <= hour <= 21
-    if asset_type == "crypto":
-        return (7 <= hour <= 11) or (13 <= hour <= 21)
-    return True
+def add_atr(df: pd.DataFrame, period=14):
+    df = df.copy()
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(period).mean()
+    df["atr_percent"] = (df["atr"] / df["close"]) * 100
+    return df
 
 
-def risk_reward_from_meta(meta: dict):
+def risk_reward_ratio(direction: str, entry: float, stop: float, target: float):
     try:
-        entry = (float(meta.get("entry_low")) + float(meta.get("entry_high"))) / 2
-        stop = float(meta.get("stop_loss"))
-        tp3 = float(meta.get("tp3"))
-        risk = abs(entry - stop)
-        reward = abs(tp3 - entry)
-        return reward / risk if risk > 0 else 0
+        if "SELL" in direction:
+            risk = abs(stop - entry)
+            reward = abs(entry - target)
+        else:
+            risk = abs(entry - stop)
+            reward = abs(target - entry)
+        if risk <= 0:
+            return 0
+        return reward / risk
     except Exception:
         return 0
 
 
-def is_a_plus_setup(meta: dict, asset_type: str):
-    direction = meta.get("direction", "")
-    if direction == "WAIT" or not ("BUY" in direction or "SELL" in direction):
-        return False
-    if float(meta.get("confidence") or 0) < max(PREMIUM_MIN_CONFIDENCE, 82):
-        return False
-    if risk_reward_from_meta(meta) < 3:
-        return False
-    if not current_session_ok(asset_type):
-        return False
-
-    structure = str(meta.get("structure_text", ""))
-    fvg = str(meta.get("fvg", ""))
-    liquidity = str(meta.get("liquidity", ""))
-
-    has_structure = "BOS" in structure or "CHoCH" in structure
-    has_fvg = "FVG" in fvg and "No clear" not in fvg
-    has_liquidity = "sweep detected" in liquidity
-
-    return has_structure and (has_fvg or has_liquidity)
+def is_active_trading_session(asset_type: str):
+    """Avoid low-liquidity hours for forex/stocks. Crypto remains allowed."""
+    hour = now_utc().hour
+    if asset_type == "crypto":
+        return True
+    if asset_type == "forex":
+        # London + New York liquid window in UTC.
+        return 7 <= hour <= 21
+    if asset_type == "stock":
+        # US stock market approximate active window in UTC.
+        return 13 <= hour <= 21
+    return True
 
 
-def grade_setup(meta: dict, asset_type: str):
-    rr = risk_reward_from_meta(meta)
-    confidence = float(meta.get("confidence") or 0)
-    if confidence >= 88 and rr >= 3 and is_a_plus_setup(meta, asset_type):
-        return "A+"
-    if confidence >= 82 and rr >= 2.5:
-        return "A"
-    return "B"
+def direction_matches_trend(direction: str, trend: str):
+    if "BUY" in direction:
+        return trend == "Bullish"
+    if "SELL" in direction:
+        return trend == "Bearish"
+    return False
+
+
+def structure_is_strong(df: pd.DataFrame):
+    structure_text, _ = detect_bos_choch(df)
+    liquidity = detect_liquidity_sweep(df)
+    fvg = detect_fvg(df)
+    # A practical retest/confirmation filter: structure break plus either liquidity sweep or FVG.
+    has_structure = "BOS" in structure_text or "CHoCH" in structure_text
+    has_confirmation = "liquidity sweep" in liquidity.lower() or "FVG" in fvg
+    return has_structure and has_confirmation
+
+
+def add_quality_fields(meta: dict, df: pd.DataFrame, asset_type: str, daily_trend: str):
+    df_atr = add_atr(df)
+    atr_percent = float(df_atr["atr_percent"].iloc[-1]) if not pd.isna(df_atr["atr_percent"].iloc[-1]) else 0
+    entry_mid = (float(meta["entry_low"]) + float(meta["entry_high"])) / 2
+    rr = risk_reward_ratio(meta.get("direction", ""), entry_mid, float(meta["stop_loss"]), float(meta["tp3"]))
+
+    meta["daily_trend"] = daily_trend
+    meta["atr_percent"] = round(atr_percent, 3)
+    meta["risk_reward"] = round(rr, 2)
+    meta["session_ok"] = is_active_trading_session(asset_type)
+    meta["structure_confirmed"] = structure_is_strong(df)
+
+    atr_min = 0.04 if asset_type == "forex" else 0.12 if asset_type == "crypto" else 0.08
+    aplus = (
+        meta.get("confidence", 0) >= A_PLUS_MIN_CONFIDENCE
+        and meta.get("direction") != "WAIT"
+        and direction_matches_trend(meta.get("direction", ""), daily_trend)
+        and atr_percent >= atr_min
+        and rr >= 3
+        and meta["session_ok"]
+        and meta["structure_confirmed"]
+    )
+    meta["grade"] = "A+" if aplus else "B"
+    return meta
 
 
 def detect_liquidity_sweep(df: pd.DataFrame):
@@ -1240,18 +1289,6 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
             "tp3": tp3,
             "support": support,
             "resistance": resistance,
-            "structure_text": structure_text,
-            "structure_bias": structure_bias,
-            "fvg": fvg,
-            "order_block": order_block,
-            "liquidity": liquidity,
-            "risk_reward": risk_reward_from_meta({
-                "direction": direction,
-                "entry_low": entry_low,
-                "entry_high": entry_high,
-                "stop_loss": stop,
-                "tp3": tp3,
-            }),
             "leverage_used_for_display": VIP_LEVERAGE,
             "created_at": now_utc().isoformat(),
         }
@@ -1335,7 +1372,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
 async def build_crypto_signal(symbol: str, vip=False):
     df = fetch_crypto_klines(symbol, "15", 150)
     mtf = {}
-    for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240"), ("1D", "1d")]:
+    for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
         try:
             tf_df = fetch_crypto_klines(symbol, interval, 150)
             mtf[tf_label] = simple_trend(tf_df)
@@ -1349,20 +1386,27 @@ async def score_symbol(symbol: str, asset_type="crypto"):
     if asset_type == "crypto":
         df = fetch_crypto_klines(symbol, "15", 150)
         mtf = {}
-        for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240"), ("1D", "1d")]:
+        for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
             try:
                 tf_df = fetch_crypto_klines(symbol, interval, 150)
                 mtf[tf_label] = simple_trend(tf_df)
             except Exception:
                 mtf[tf_label] = "Unavailable"
         meta = generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
-        meta["grade"] = grade_setup(meta, "crypto")
-        return meta
+        try:
+            daily_trend = simple_trend(fetch_crypto_klines(symbol, "1d", 220))
+        except Exception:
+            daily_trend = mtf.get("4H", "Mixed")
+        return add_quality_fields(meta, df, asset_type, daily_trend)
 
-    df = fetch_twelvedata(symbol, asset_type)
+    df = fetch_yahoo_klines(symbol, asset_type, "15m", 150)
     meta = generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
-    meta["grade"] = grade_setup(meta, asset_type)
-    return meta
+    try:
+        daily_trend = simple_trend(fetch_yahoo_klines(symbol, asset_type, "1d", 220))
+    except Exception:
+        daily_trend = simple_trend(df)
+    return add_quality_fields(meta, df, asset_type, daily_trend)
+
 
 
 
@@ -1393,7 +1437,7 @@ def save_vip_signal(user_id: int, asset_type: str, meta: dict):
 def fetch_for_asset(symbol: str, asset_type: str):
     if asset_type == "crypto":
         return fetch_crypto_klines(symbol, "15", 150)
-    return fetch_twelvedata(symbol, asset_type)
+    return fetch_yahoo_klines(symbol, asset_type, "15m", 150)
 
 
 def evaluate_signal_outcome(row: dict):
@@ -1617,7 +1661,7 @@ def get_active_premium_user_ids():
 
 
 async def automatic_vip_signal_check(context: ContextTypes.DEFAULT_TYPE):
-    # Disabled by request: VIP signals scan only when a premium user requests them.
+    # Disabled by design. VIP signals are request-only to protect API usage.
     return
 
 
@@ -1631,52 +1675,54 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         await show_premium(chat_id, user_id, context)
         return
 
-    # Scan only after user request. Keep quiet if no A/A+ setup is found.
     candidates = []
 
+    # Request-only scan. No automatic 24/7 scan and no "no setup" reply.
     for symbol in CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT]:
         try:
             meta = await score_symbol(symbol, "crypto")
-            if is_a_plus_setup(meta, "crypto"):
+            if meta.get("grade") == "A+" and meta["direction"] != "WAIT":
                 meta["asset_type"] = "crypto"
                 candidates.append(meta)
         except Exception as e:
             logger.warning("Crypto scan failed for %s: %s", symbol, e)
 
-    if TWELVEDATA_API_KEY:
-        for symbol in FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT]:
-            try:
-                meta = await score_symbol(symbol, "forex")
-                if is_a_plus_setup(meta, "forex"):
-                    meta["asset_type"] = "forex"
-                    candidates.append(meta)
-            except Exception as e:
-                logger.warning("Forex scan failed for %s: %s", symbol, e)
+    # Forex/stocks now use Yahoo Finance. Keep limits low through env if needed.
+    for symbol in FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT]:
+        try:
+            meta = await score_symbol(symbol, "forex")
+            if meta.get("grade") == "A+" and meta["direction"] != "WAIT":
+                meta["asset_type"] = "forex"
+                candidates.append(meta)
+        except Exception as e:
+            logger.warning("Forex scan failed for %s: %s", symbol, e)
 
-        for symbol in STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT]:
-            try:
-                meta = await score_symbol(symbol, "stock")
-                if is_a_plus_setup(meta, "stock"):
-                    meta["asset_type"] = "stock"
-                    candidates.append(meta)
-            except Exception as e:
-                logger.warning("Stock scan failed for %s: %s", symbol, e)
+    for symbol in STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT]:
+        try:
+            meta = await score_symbol(symbol, "stock")
+            if meta.get("grade") == "A+" and meta["direction"] != "WAIT":
+                meta["asset_type"] = "stock"
+                candidates.append(meta)
+        except Exception as e:
+            logger.warning("Stock scan failed for %s: %s", symbol, e)
 
-    candidates = sorted(
-        candidates,
-        key=lambda x: (x.get("grade") == "A+", x.get("confidence", 0), x.get("risk_reward", 0)),
-        reverse=True
-    )[:PREMIUM_DAILY_LIMIT]
+    candidates = sorted(candidates, key=lambda x: (x.get("confidence", 0), x.get("risk_reward", 0)), reverse=True)[:PREMIUM_DAILY_LIMIT]
 
     if not candidates:
-        # Do not send "no signal" message by request.
+        # User requested silence when no good setup exists.
         return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"💎 Found *{len(candidates)}* A+ premium setup(s). Sending now...",
+        parse_mode="Markdown",
+    )
 
     for item in candidates:
         try:
             await send_analysis(chat_id, user_id, context, item["symbol"], item["asset_type"], premium=True)
         except Exception as e:
-            logger.warning("Failed to send premium signal %s: %s", item.get("symbol"), e)
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to send {item['symbol']}: {e}")
 
 
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1694,19 +1740,22 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
         if premium:
             df = fetch_crypto_klines(symbol, "15", 150)
             mtf = {}
-            for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240"), ("1D", "1d")]:
+            for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
                 try:
                     mtf[tf_label] = simple_trend(fetch_crypto_klines(symbol, interval, 150))
                 except Exception:
                     mtf[tf_label] = "Unavailable"
             meta = generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
-            meta["grade"] = grade_setup(meta, asset_type)
     elif asset_type in ["forex", "stock"]:
-        df = fetch_twelvedata(symbol, asset_type)
+        df = fetch_yahoo_klines(symbol, asset_type, "15m", 150)
         signal = generate_signal(df, symbol, mtf=None, vip=premium, lock_free=not premium)
         if premium:
             meta = generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
-            meta["grade"] = grade_setup(meta, asset_type)
+            try:
+                daily_trend = simple_trend(fetch_yahoo_klines(symbol, asset_type, "1d", 220))
+            except Exception:
+                daily_trend = simple_trend(df)
+            meta = add_quality_fields(meta, df, asset_type, daily_trend)
     else:
         raise ValueError("Asset type must be crypto, forex, or stock.")
 
@@ -1723,7 +1772,6 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
                     f"Symbol: `{order['symbol']}`\n"
                     f"Type: `{order['order_type']}`\n"
                     f"Lot Size: `{order['lot_size']}`\n"
-                    f"Grade: `{meta.get('grade', 'A')}`\n"
                     f"Entry: `{order['entry_price']:.6g}`\n"
                     f"SL: `{float(order['stop_loss']):.6g}`\n"
                     f"TP1: `{float(order['tp1']):.6g}`\n\n"
@@ -1849,10 +1897,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     clean = text.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
-
-    if clean in ["GETSIGNAL", "GETVIP", "VIPSIGNAL", "SIGNAL"]:
-        await premium_signals(update.effective_chat.id, update.effective_user.id, context)
-        return
 
     crypto_shortcuts = [s.replace("USDT", "") for s in CRYPTO_WATCHLIST]
     forex_symbols = [s.replace("/", "") for s in FOREX_WATCHLIST]
@@ -2036,7 +2080,7 @@ async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 Daily VIP Limit: *{PREMIUM_DAILY_LIMIT}*\n"
         f"📊 VIP Min Confidence: *{PREMIUM_MIN_CONFIDENCE}%*\n"
         f"⚡ VIP Leverage Display: *{VIP_LEVERAGE:g}x*\n"
-        f"🤖 Auto VIP: *Disabled - request only*\n"
+        f"🤖 Auto VIP: *{AUTO_VIP_SIGNALS_ENABLED}* every *{AUTO_VIP_SCAN_MINUTES} min*\n"
         f"🧾 Max MT5 Orders/User: *{MAX_ACTIVE_MT5_ORDERS}*\n\n"
         f"🏃 Running Signals: *{running}*\n"
         f"✅ Wins: *{wins}*\n"

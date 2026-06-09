@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import math
 import base64
@@ -206,6 +207,9 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
 
     profile = get_mt5_profile(user_id)
     direction = meta.get("direction", "")
+    if direction == "WAIT" or not ("BUY" in direction or "SELL" in direction):
+        return {"queued": False, "reason": "Signal is WAIT/neutral"}
+
     entry = (float(meta.get("entry_low")) + float(meta.get("entry_high"))) / 2
 
     order = {
@@ -215,7 +219,7 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         "asset_type": asset_type,
         "symbol": meta.get("symbol"),
         "direction": direction,
-        "order_type": "BUY_LIMIT" if "BUY" in direction else "SELL_LIMIT" if "SELL" in direction else "NONE",
+        "order_type": "MARKET_BUY" if "BUY" in direction else "MARKET_SELL" if "SELL" in direction else "NONE",
         "lot_size": mt5_lot_size(user_id),
         "entry_price": entry,
         "entry_low": meta.get("entry_low"),
@@ -1637,14 +1641,14 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "🤖 *MT5 Auto Order Queued*\n\n"
+                    "🤖 *MT5 EA Order Queued*\n\n"
                     f"Symbol: `{order['symbol']}`\n"
                     f"Type: `{order['order_type']}`\n"
                     f"Lot Size: `{order['lot_size']}`\n"
                     f"Entry: `{order['entry_price']:.6g}`\n"
                     f"SL: `{float(order['stop_loss']):.6g}`\n"
                     f"TP1: `{float(order['tp1']):.6g}`\n\n"
-                    "Keep your laptop, MT5, and MT5 Bridge running for execution."
+                    "Keep MT5 open and the InfluencerTech EA attached to any chart."
                 ),
                 parse_mode="Markdown",
             )
@@ -1872,30 +1876,54 @@ async def scheduled_news_check(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Failed to send news to %s: %s", user_id, e)
 
 
+async def _send_broadcast_message(bot, user_id: int, text: str):
+    try:
+        await bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
+        return True
+    except Exception as e:
+        logger.warning("Broadcast failed for %s: %s", user_id, e)
+        return False
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Admin only.")
         return
 
-    message = " ".join(context.args)
+    message = " ".join(context.args).strip()
     if not message:
         await update.message.reply_text("Use: /broadcast your message")
         return
 
     users = load_json(USERS_FILE, [])
-    sent = 0
-    for user_id in users:
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📢 *Broadcast*\n🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n{message}",
-                parse_mode="Markdown"
-            )
-            sent += 1
-        except Exception:
-            pass
+    users = list(dict.fromkeys(users))
+    if not users:
+        await update.message.reply_text("No users found in users.json yet.")
+        return
 
-    await update.message.reply_text(f"✅ Broadcast sent to {sent} users.")
+    text = (
+        "📢 *Broadcast*\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+        f"{message}"
+    )
+
+    await update.message.reply_text(f"📢 Sending broadcast to {len(users)} users...")
+
+    sent = 0
+    failed = 0
+    batch_size = 20
+
+    for i in range(0, len(users), batch_size):
+        batch = users[i:i + batch_size]
+        results = await asyncio.gather(
+            *[_send_broadcast_message(context.bot, user_id, text) for user_id in batch],
+            return_exceptions=True,
+        )
+        sent += sum(1 for result in results if result is True)
+        failed += sum(1 for result in results if result is not True)
+        await asyncio.sleep(0.5)
+
+    await update.message.reply_text(f"✅ Broadcast finished. Sent: {sent}. Failed: {failed}.")
 
 
 async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):

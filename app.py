@@ -81,6 +81,8 @@ telegram_app.add_handler(CommandHandler("givepremium", givepremium))
 telegram_app.add_handler(CommandHandler("viphistory", vip_history_command))
 telegram_app.add_handler(CommandHandler("vipperformance", vip_performance_command))
 telegram_app.add_handler(CommandHandler("adminstats", adminstats))
+telegram_app.add_handler(CommandHandler("clearmt5", clearmt5))
+telegram_app.add_handler(CommandHandler("mt5queue", mt5queue))
 if setlot:
     telegram_app.add_handler(CommandHandler("setlot", setlot))
 if mt5link:

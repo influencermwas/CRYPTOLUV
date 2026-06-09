@@ -55,6 +55,8 @@ USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
 VIP_HISTORY_TABLE = os.getenv("VIP_HISTORY_TABLE", "signals_vip_history").strip()
 PREMIUM_TABLE = os.getenv("PREMIUM_TABLE", "signals_premium_users").strip()
+VIP_ALERTS_FILE = "vip_tp_alerts.json"
+REFERRALS_FILE = "premium_referrals.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -429,6 +431,134 @@ def activate_premium(user_id: int, hours=24, source="paid", mark_trial_used=Fals
     return expires_dt
 
 
+
+
+def extend_premium(user_id: int, hours=24, source="referral_reward"):
+    """Add premium time without removing any active remaining time."""
+    active, current_expires = is_premium(user_id)
+    base = current_expires if active and current_expires and current_expires > now_utc() else now_utc()
+    expires_dt = base + timedelta(hours=hours)
+
+    if USE_SUPABASE:
+        payload = {
+            "user_id": str(user_id),
+            "expires_at": expires_dt.isoformat(),
+            "source": source,
+            "remind_6h_sent": False,
+            "remind_1h_sent": False,
+            "expired_notice_sent": False,
+            "updated_at": now_utc().isoformat(),
+        }
+        sb_upsert(PREMIUM_TABLE, payload)
+
+    premium = load_json(PREMIUM_FILE, {})
+    premium[str(user_id)] = expires_dt.isoformat()
+    save_json(PREMIUM_FILE, premium)
+    return expires_dt
+
+
+def load_referrals():
+    return load_json(REFERRALS_FILE, {})
+
+
+def save_referrals(data):
+    save_json(REFERRALS_FILE, data)
+
+
+def register_referral(referred_user_id: int, referrer_id: int):
+    """Store who invited a user. Reward happens only after paid premium activation."""
+    if not referrer_id or referrer_id == referred_user_id:
+        return False
+
+    referrals = load_referrals()
+    key = str(referred_user_id)
+    if key in referrals:
+        return False
+
+    referrals[key] = {
+        "referred_user_id": str(referred_user_id),
+        "referrer_id": str(referrer_id),
+        "created_at": now_utc().isoformat(),
+        "rewarded": False,
+        "rewarded_at": None,
+    }
+    save_referrals(referrals)
+    return True
+
+
+async def get_referral_link(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    me = await context.bot.get_me()
+    return f"https://t.me/{me.username}?start=ref_{user_id}"
+
+
+async def send_referral_program(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    referrals = load_referrals()
+    invited = [r for r in referrals.values() if str(r.get("referrer_id")) == str(user_id)]
+    rewarded = [r for r in invited if r.get("rewarded")]
+    pending = [r for r in invited if not r.get("rewarded")]
+    link = await get_referral_link(context, user_id)
+    active, expires = is_premium(user_id)
+    expiry_text = expires.strftime("%Y-%m-%d %H:%M UTC") if active and expires else "Not active"
+
+    recent_lines = []
+    for r in sorted(invited, key=lambda x: x.get("created_at", ""), reverse=True)[:5]:
+        status = "✅ Activated" if r.get("rewarded") else "⏳ Pending"
+        referred = r.get("referred_user_id", "Unknown")
+        recent_lines.append(f"{status} - `{referred}`")
+    recent_text = "\n".join(recent_lines) if recent_lines else "No referrals yet."
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🤝 *Referral Dashboard*\n\n"
+            "Share your link. When your referred user activates *paid Premium*, "
+            "you receive *1 extra Premium day* automatically.\n\n"
+            f"👥 Total Referrals: *{len(invited)}*\n"
+            f"✅ Activated Premium: *{len(rewarded)}*\n"
+            f"⏳ Pending: *{len(pending)}*\n"
+            f"🎁 Premium Days Earned: *{len(rewarded)}*\n"
+            f"💎 Your Premium Expiry: `{expiry_text}`\n\n"
+            f"🔗 *Your Referral Link:*\n`{link}`\n\n"
+            f"📋 *Recent Referrals:*\n{recent_text}\n\n"
+            "✅ Reward is given once per referred user after successful M-Pesa payment."
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def reward_referrer_for_paid_premium(referred_user_id: int, bot):
+    referrals = load_referrals()
+    key = str(referred_user_id)
+    referral = referrals.get(key)
+    if not referral or referral.get("rewarded"):
+        return None
+
+    referrer_id = int(referral.get("referrer_id") or 0)
+    if not referrer_id or referrer_id == referred_user_id:
+        return None
+
+    expires = extend_premium(referrer_id, 24, source=f"referral_reward:{referred_user_id}")
+    referral["rewarded"] = True
+    referral["rewarded_at"] = now_utc().isoformat()
+    referrals[key] = referral
+    save_referrals(referrals)
+
+    try:
+        await bot.send_message(
+            chat_id=referrer_id,
+            text=(
+                "🎁 *Referral Reward Added!*\n\n"
+                "Your referred user activated Premium.\n"
+                "You received *1 free day of Premium*.\n\n"
+                f"New expiry: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`"
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Could not notify referral referrer %s: %s", referrer_id, e)
+
+    return referrer_id
+
 def ensure_free_trial(user_id: int):
     """Give 24h free trial once per user. Returns expiry if trial was created."""
     if USE_SUPABASE:
@@ -504,6 +634,7 @@ def main_menu():
             InlineKeyboardButton("⚡ DOGE", callback_data="quick_DOGEUSDT"),
         ],
         [InlineKeyboardButton("💎 Premium Signals", callback_data="premium")],
+        [InlineKeyboardButton("🤝 Referral Dashboard", callback_data="referral")],
         [
             InlineKeyboardButton("📜 VIP History", callback_data="vip_history"),
             InlineKeyboardButton("📊 VIP Performance", callback_data="vip_performance"),
@@ -516,6 +647,15 @@ def main_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
+
+    # Deep link example: https://t.me/YOUR_BOT?start=ref_123456789
+    if context.args:
+        raw_ref = str(context.args[0]).strip()
+        if raw_ref.startswith("ref_"):
+            try:
+                register_referral(update.effective_user.id, int(raw_ref.replace("ref_", "", 1)))
+            except Exception as e:
+                logger.warning("Invalid referral code %s: %s", raw_ref, e)
 
     if not await has_required_access(update.effective_user.id, context):
         await send_access_gate(update.effective_chat.id, context)
@@ -568,6 +708,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_analysis(query.message.chat_id, query.from_user.id, context, symbol, "crypto", premium=False)
     elif data == "premium":
         await show_premium(query.message.chat_id, query.from_user.id, context)
+    elif data == "referral":
+        await send_referral_program(query.message.chat_id, query.from_user.id, context)
     elif data == "vip_signal":
         await premium_signals(query.message.chat_id, query.from_user.id, context)
     elif data == "pay_premium":
@@ -617,7 +759,8 @@ async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             text=(
                 "✅ *Premium Active*\n\n"
                 f"Expires: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
-                "Tap below to receive today's VIP signals."
+                "Tap below to receive today's VIP signals.\n\n"
+                "🤝 Share your referral link to earn 1 free Premium day when your friend pays."
             ),
             parse_mode="Markdown",
             reply_markup=keyboard,
@@ -637,7 +780,8 @@ async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             "🔥 Stop loss\n"
             "🔥 CHoCH, BOS, FVG\n"
             "🔥 Order block and liquidity sweep\n\n"
-            "Tap below to pay automatically using STK Push."
+            "Tap below to pay automatically using STK Push.\n\n"
+            "🤝 After subscribing, share your referral link and earn 1 free Premium day per paid referral."
         ),
         parse_mode="Markdown",
         reply_markup=keyboard,
@@ -759,6 +903,7 @@ async def handle_mpesa_callback(data: dict, bot):
 
     if result_code == 0:
         expires = activate_premium(user_id, 24)
+        await reward_referrer_for_paid_premium(user_id, bot)
         pending.pop(checkout_id, None)
         save_json(PENDING_FILE, pending)
 
@@ -1499,7 +1644,22 @@ def fetch_for_asset(symbol: str, asset_type: str):
     return fetch_yahoo_klines(symbol, asset_type, "15m", 150)
 
 
-def evaluate_signal_outcome(row: dict):
+def signal_local_key(row: dict):
+    return str(row.get("id") or f"{row.get('user_id')}:{row.get('symbol')}:{row.get('created_at')}")
+
+
+def hit_profit_percent(direction: str, entry_mid: float, price: float):
+    if not entry_mid:
+        return 0.0
+    if "SELL" in direction:
+        move = ((entry_mid - price) / entry_mid) * 100
+    else:
+        move = ((price - entry_mid) / entry_mid) * 100
+    return round(move * VIP_LEVERAGE, 2)
+
+
+def evaluate_signal_progress(row: dict):
+    """Return all TP/SL levels touched since signal creation. TP1/TP2 stay RUNNING; TP3 or SL closes."""
     try:
         df = fetch_for_asset(row["symbol"], row.get("asset_type", "crypto"))
         created = parse_dt(row.get("created_at")) or (now_utc() - timedelta(days=3))
@@ -1516,46 +1676,129 @@ def evaluate_signal_outcome(row: dict):
         tp3 = float(row.get("tp3"))
         entry_mid = (float(row.get("entry_low")) + float(row.get("entry_high"))) / 2
 
+        hits = []
+        final_status = "RUNNING"
+        final_profit = 0.0
+
         for _, c in df.iterrows():
             high = float(c["high"])
             low = float(c["low"])
+
             if "BUY" in direction:
+                # Conservative rule: if SL and TP happen in the same candle, SL is counted first.
                 if low <= stop:
-                    return "LOSS", round(((stop - entry_mid) / entry_mid) * 100, 2)
-                if high >= tp3:
-                    return "WIN", round(((tp3 - entry_mid) / entry_mid) * 100, 2)
-                if high >= tp2:
-                    return "WIN", round(((tp2 - entry_mid) / entry_mid) * 100, 2)
-                if high >= tp1:
-                    return "WIN", round(((tp1 - entry_mid) / entry_mid) * 100, 2)
+                    hits.append(("SL", stop, hit_profit_percent(direction, entry_mid, stop)))
+                    final_status = "LOSS"
+                    final_profit = round(((stop - entry_mid) / entry_mid) * 100, 2)
+                    break
+                if high >= tp1 and not any(h[0] == "TP1" for h in hits):
+                    hits.append(("TP1", tp1, hit_profit_percent(direction, entry_mid, tp1)))
+                if high >= tp2 and not any(h[0] == "TP2" for h in hits):
+                    hits.append(("TP2", tp2, hit_profit_percent(direction, entry_mid, tp2)))
+                if high >= tp3 and not any(h[0] == "TP3" for h in hits):
+                    hits.append(("TP3", tp3, hit_profit_percent(direction, entry_mid, tp3)))
+                    final_status = "WIN"
+                    final_profit = round(((tp3 - entry_mid) / entry_mid) * 100, 2)
+                    break
+
             elif "SELL" in direction:
                 if high >= stop:
-                    return "LOSS", round(((entry_mid - stop) / entry_mid) * 100, 2)
-                if low <= tp3:
-                    return "WIN", round(((entry_mid - tp3) / entry_mid) * 100, 2)
-                if low <= tp2:
-                    return "WIN", round(((entry_mid - tp2) / entry_mid) * 100, 2)
-                if low <= tp1:
-                    return "WIN", round(((entry_mid - tp1) / entry_mid) * 100, 2)
+                    hits.append(("SL", stop, hit_profit_percent(direction, entry_mid, stop)))
+                    final_status = "LOSS"
+                    final_profit = round(((entry_mid - stop) / entry_mid) * 100, 2)
+                    break
+                if low <= tp1 and not any(h[0] == "TP1" for h in hits):
+                    hits.append(("TP1", tp1, hit_profit_percent(direction, entry_mid, tp1)))
+                if low <= tp2 and not any(h[0] == "TP2" for h in hits):
+                    hits.append(("TP2", tp2, hit_profit_percent(direction, entry_mid, tp2)))
+                if low <= tp3 and not any(h[0] == "TP3" for h in hits):
+                    hits.append(("TP3", tp3, hit_profit_percent(direction, entry_mid, tp3)))
+                    final_status = "WIN"
+                    final_profit = round(((entry_mid - tp3) / entry_mid) * 100, 2)
+                    break
+
+        return {"hits": hits, "status": final_status, "profit_percent": final_profit}
     except Exception as e:
-        logger.warning("Signal outcome check failed: %s", e)
+        logger.warning("Signal progress check failed: %s", e)
     return None
+
+
+def evaluate_signal_outcome(row: dict):
+    progress = evaluate_signal_progress(row)
+    if not progress or progress.get("status") == "RUNNING":
+        return None
+    return progress.get("status"), progress.get("profit_percent", 0)
+
+
+def format_hit_alert(row: dict, level: str, price: float, leverage_profit: float):
+    symbol = row.get("symbol", "")
+    direction = row.get("direction", "")
+    entry_mid = (float(row.get("entry_low")) + float(row.get("entry_high"))) / 2
+    grade = row.get("grade") or signal_grade(int(row.get("confidence") or 0))
+
+    if level == "TP1":
+        title = "🎯 TP1 HIT"
+        note = "Protect the trade. Consider moving SL to breakeven."
+    elif level == "TP2":
+        title = "🚀 TP2 HIT"
+        note = "Strong move. Consider locking partial profit."
+    elif level == "TP3":
+        title = "🏆 TP3 HIT — FULL TARGET"
+        note = "Signal closed in profit."
+    else:
+        title = "❌ STOP LOSS HIT"
+        note = "Signal closed. Wait for the next clean setup."
+
+    return (
+        f"{title}\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+        f"Symbol: `{symbol}`\n"
+        f"Grade: *{grade}*\n"
+        f"Direction: *{direction}*\n"
+        f"Entry: `{entry_mid:.6g}`\n"
+        f"Hit Price: `{price:.6g}`\n"
+        f"Result @ {VIP_LEVERAGE:g}x: `{leverage_profit:+.2f}%`\n\n"
+        f"{note}"
+    )
 
 
 async def update_vip_results(context: ContextTypes.DEFAULT_TYPE = None):
     if not USE_SUPABASE:
         return
     rows = sb_get(VIP_HISTORY_TABLE, {"status": "eq.RUNNING", "select": "*", "limit": "100"}) or []
+    alerted = load_json(VIP_ALERTS_FILE, {})
+
     for row in rows:
-        result = evaluate_signal_outcome(row)
-        if not result:
+        progress = evaluate_signal_progress(row)
+        if not progress:
             continue
-        status, profit_percent = result
-        sb_patch(VIP_HISTORY_TABLE, {"id": f"eq.{row['id']}"}, {
-            "status": status,
-            "profit_percent": profit_percent,
-            "updated_at": now_utc().isoformat(),
-        })
+
+        row_key = signal_local_key(row)
+        already = set(alerted.get(row_key, []))
+
+        for level, price, leverage_profit in progress.get("hits", []):
+            if level in already:
+                continue
+            if context is not None:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(row.get("user_id")),
+                        text=format_hit_alert(row, level, price, leverage_profit),
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logger.warning("Failed to send %s alert for %s: %s", level, row_key, e)
+            already.add(level)
+
+        alerted[row_key] = sorted(already)
+        save_json(VIP_ALERTS_FILE, alerted)
+
+        if progress.get("status") in ["WIN", "LOSS"]:
+            sb_patch(VIP_HISTORY_TABLE, {"id": f"eq.{row['id']}"}, {
+                "status": progress.get("status"),
+                "profit_percent": progress.get("profit_percent", 0),
+                "updated_at": now_utc().isoformat(),
+            })
 
 
 async def send_vip_history(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -1626,6 +1869,11 @@ async def vip_performance_command(update: Update, context: ContextTypes.DEFAULT_
     register_user(update.effective_user.id)
     admin_all = update.effective_user.id == ADMIN_ID and context.args and context.args[0].lower() == "all"
     await send_vip_performance(update.effective_chat.id, update.effective_user.id, context, admin_all=admin_all)
+
+
+async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    await send_referral_program(update.effective_chat.id, update.effective_user.id, context)
 
 
 async def givepremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2088,7 +2336,21 @@ async def _send_broadcast_message(bot, user_id: int, text: str):
         await bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
         return True
     except Exception as e:
-        logger.warning("Broadcast failed for %s: %s", user_id, e)
+        logger.warning("Broadcast text failed for %s: %s", user_id, e)
+        return False
+
+
+async def _copy_broadcast_message(bot, user_id: int, source_chat_id: int, message_id: int):
+    """Copy any Telegram message: photo, video, document, audio, voice, sticker or text."""
+    try:
+        await bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=source_chat_id,
+            message_id=message_id,
+        )
+        return True
+    except Exception as e:
+        logger.warning("Broadcast media/copy failed for %s: %s", user_id, e)
         return False
 
 
@@ -2097,24 +2359,40 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Admin only.")
         return
 
-    message = " ".join(context.args).strip()
-    if not message:
-        await update.message.reply_text("Use: /broadcast your message")
-        return
-
     users = load_json(USERS_FILE, [])
     users = list(dict.fromkeys(users))
     if not users:
         await update.message.reply_text("No users found in users.json yet.")
         return
 
-    text = (
-        "📢 *Broadcast*\n"
-        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
-        f"{message}"
-    )
+    reply = update.message.reply_to_message
+    message = " ".join(context.args).strip()
 
-    await update.message.reply_text(f"📢 Sending broadcast to {len(users)} users...")
+    if reply:
+        mode = "copy"
+        source_chat_id = reply.chat_id
+        source_message_id = reply.message_id
+        await update.message.reply_text(
+            f"📢 Forwarding/copying replied message to {len(users)} users...\n"
+            "Supported: text, photos, videos, files, audio, stickers and captions."
+        )
+    elif message:
+        mode = "text"
+        text = (
+            "📢 *Broadcast*\n"
+            "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+            f"{message}"
+        )
+        await update.message.reply_text(f"📢 Sending text broadcast to {len(users)} users...")
+    else:
+        await update.message.reply_text(
+            "Use one of these:\n\n"
+            "1️⃣ `/broadcast your message` for text.\n"
+            "2️⃣ Reply `/broadcast` to any photo, video, document, voice note, sticker, or text message to broadcast it."
+            ,
+            parse_mode="Markdown",
+        )
+        return
 
     sent = 0
     failed = 0
@@ -2122,10 +2400,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
-        results = await asyncio.gather(
-            *[_send_broadcast_message(context.bot, user_id, text) for user_id in batch],
-            return_exceptions=True,
-        )
+        if mode == "copy":
+            tasks = [_copy_broadcast_message(context.bot, user_id, source_chat_id, source_message_id) for user_id in batch]
+        else:
+            tasks = [_send_broadcast_message(context.bot, user_id, text) for user_id in batch]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         sent += sum(1 for result in results if result is True)
         failed += sum(1 for result in results if result is not True)
         await asyncio.sleep(0.5)
@@ -2181,6 +2461,8 @@ def main():
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("premium", premium_command))
+    app.add_handler(CommandHandler("referral", referral_command))
+    app.add_handler(CommandHandler("referrals", referral_command))
     app.add_handler(CommandHandler("givepremium", givepremium))
     app.add_handler(CommandHandler("viphistory", vip_history_command))
     app.add_handler(CommandHandler("vipperformance", vip_performance_command))

@@ -44,6 +44,8 @@ PENDING_FILE = "pending_payments.json"
 MT5_USERS_FILE = "mt5_users.json"
 MT5_ORDERS_FILE = "mt5_orders.json"
 AUTO_VIP_FILE = "auto_vip_last_sent.json"
+CACHE_FILE = "market_cache.json"
+CACHE_MINUTES = int(os.getenv("CACHE_MINUTES", "15") or 15)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")).strip()
@@ -92,7 +94,7 @@ PREMIUM_CRYPTO_SCAN_LIMIT = int(os.getenv("PREMIUM_CRYPTO_SCAN_LIMIT", "12") or 
 PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "8") or 8)
 PREMIUM_STOCK_SCAN_LIMIT = int(os.getenv("PREMIUM_STOCK_SCAN_LIMIT", "8") or 8)
 VIP_LEVERAGE = float(os.getenv("VIP_LEVERAGE", "10") or 10)
-AUTO_VIP_SIGNALS_ENABLED = os.getenv("AUTO_VIP_SIGNALS_ENABLED", "1").strip() == "1"
+AUTO_VIP_SIGNALS_ENABLED = os.getenv("AUTO_VIP_SIGNALS_ENABLED", "0").strip() == "1"
 AUTO_VIP_SCAN_MINUTES = int(os.getenv("AUTO_VIP_SCAN_MINUTES", "60") or 60)
 MAX_ACTIVE_MT5_ORDERS = int(os.getenv("MAX_ACTIVE_MT5_ORDERS", "4") or 4)
 
@@ -197,9 +199,9 @@ def leverage_pnl_percent(direction: str, entry: float, target: float):
 
 
 def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
-    """Queue a VIP signal for the user's laptop MT5 bridge. The laptop bridge pulls these orders."""
+    """Queue a VIP signal for the MT5 EA. The EA pulls these orders from app.py."""
     if not is_mt5_linked(user_id):
-        return {"queued": False, "reason": "MT5 not linked"}
+        return {"queued": False, "reason": "MT5 EA not linked"}
 
     active_count = active_mt5_order_count(user_id)
     if active_count >= MAX_ACTIVE_MT5_ORDERS:
@@ -826,20 +828,30 @@ def finnhub_resolution(interval="15"):
 
 def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=150):
     """
-    Uses Twelve Data for forex and stocks.
-    Crypto still uses OKX through fetch_crypto_klines().
+    Uses Twelve Data for forex and stocks with local caching.
+    Cache reduces 429 rate-limit errors and stops repeated requests for the same symbol.
     """
     if not TWELVEDATA_API_KEY:
         raise ValueError("TWELVEDATA_API_KEY is missing. Add it in Render Environment Variables.")
 
     asset_type = (asset_type or "stock").lower().strip()
+    clean_symbol_key = clean_symbol(symbol)
+    cache_key = f"{clean_symbol_key}_{asset_type}_{interval}_{outputsize}"
+
+    cache = load_json(CACHE_FILE, {})
+    cached = cache.get(cache_key)
+    if cached:
+        saved_at = parse_dt(cached.get("saved_at"))
+        if saved_at and now_utc() - saved_at < timedelta(minutes=CACHE_MINUTES):
+            df = pd.DataFrame(cached.get("rows", []))
+            if not df.empty:
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                return df.dropna().reset_index(drop=True)
 
     if asset_type == "forex":
         clean = symbol.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
-        if len(clean) == 6:
-            td_symbol = f"{clean[:3]}/{clean[3:]}"
-        else:
-            td_symbol = symbol.upper()
+        td_symbol = f"{clean[:3]}/{clean[3:]}" if len(clean) == 6 else symbol.upper()
     else:
         td_symbol = symbol.upper().replace(" ", "")
 
@@ -852,11 +864,26 @@ def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=
     }
 
     r = requests.get(url, params=params, timeout=30)
+
+    if r.status_code == 429:
+        if cached and cached.get("rows"):
+            df = pd.DataFrame(cached["rows"])
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df.dropna().reset_index(drop=True)
+        raise ValueError("TwelveData limit reached. Try again later or reduce Forex/Stock scan limits.")
+
     r.raise_for_status()
     data = r.json()
 
     if data.get("status") == "error":
-        raise ValueError(data.get("message", f"Twelve Data returned an error for {td_symbol}"))
+        msg = data.get("message", f"Twelve Data returned an error for {td_symbol}")
+        if "limit" in msg.lower() and cached and cached.get("rows"):
+            df = pd.DataFrame(cached["rows"])
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df.dropna().reset_index(drop=True)
+        raise ValueError(msg)
 
     values = data.get("values", [])
     if not values:
@@ -882,6 +909,12 @@ def fetch_twelvedata(symbol: str, asset_type: str, interval="15min", outputsize=
     if len(df) < 50:
         raise ValueError(f"Not enough Twelve Data candle data for {td_symbol}")
 
+    cache[cache_key] = {
+        "saved_at": now_utc().isoformat(),
+        "rows": df.to_dict("records"),
+    }
+    save_json(CACHE_FILE, cache)
+
     return df
 
 
@@ -901,6 +934,12 @@ def add_indicators(df: pd.DataFrame):
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+
+    prev_close = df["close"].shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    df["atr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
     return df
 
 
@@ -912,6 +951,62 @@ def simple_trend(df: pd.DataFrame):
     if last["ema20"] < last["ema50"] and last["close"] < last["ema200"]:
         return "Bearish"
     return "Mixed"
+
+
+def current_session_ok(asset_type: str):
+    hour = now_utc().hour
+    asset_type = (asset_type or "").lower()
+    if asset_type == "stock":
+        return 13 <= hour <= 21
+    if asset_type == "forex":
+        return 7 <= hour <= 21
+    if asset_type == "crypto":
+        return (7 <= hour <= 11) or (13 <= hour <= 21)
+    return True
+
+
+def risk_reward_from_meta(meta: dict):
+    try:
+        entry = (float(meta.get("entry_low")) + float(meta.get("entry_high"))) / 2
+        stop = float(meta.get("stop_loss"))
+        tp3 = float(meta.get("tp3"))
+        risk = abs(entry - stop)
+        reward = abs(tp3 - entry)
+        return reward / risk if risk > 0 else 0
+    except Exception:
+        return 0
+
+
+def is_a_plus_setup(meta: dict, asset_type: str):
+    direction = meta.get("direction", "")
+    if direction == "WAIT" or not ("BUY" in direction or "SELL" in direction):
+        return False
+    if float(meta.get("confidence") or 0) < max(PREMIUM_MIN_CONFIDENCE, 82):
+        return False
+    if risk_reward_from_meta(meta) < 3:
+        return False
+    if not current_session_ok(asset_type):
+        return False
+
+    structure = str(meta.get("structure_text", ""))
+    fvg = str(meta.get("fvg", ""))
+    liquidity = str(meta.get("liquidity", ""))
+
+    has_structure = "BOS" in structure or "CHoCH" in structure
+    has_fvg = "FVG" in fvg and "No clear" not in fvg
+    has_liquidity = "sweep detected" in liquidity
+
+    return has_structure and (has_fvg or has_liquidity)
+
+
+def grade_setup(meta: dict, asset_type: str):
+    rr = risk_reward_from_meta(meta)
+    confidence = float(meta.get("confidence") or 0)
+    if confidence >= 88 and rr >= 3 and is_a_plus_setup(meta, asset_type):
+        return "A+"
+    if confidence >= 82 and rr >= 2.5:
+        return "A"
+    return "B"
 
 
 def detect_liquidity_sweep(df: pd.DataFrame):
@@ -1145,6 +1240,18 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
             "tp3": tp3,
             "support": support,
             "resistance": resistance,
+            "structure_text": structure_text,
+            "structure_bias": structure_bias,
+            "fvg": fvg,
+            "order_block": order_block,
+            "liquidity": liquidity,
+            "risk_reward": risk_reward_from_meta({
+                "direction": direction,
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "stop_loss": stop,
+                "tp3": tp3,
+            }),
             "leverage_used_for_display": VIP_LEVERAGE,
             "created_at": now_utc().isoformat(),
         }
@@ -1228,7 +1335,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
 async def build_crypto_signal(symbol: str, vip=False):
     df = fetch_crypto_klines(symbol, "15", 150)
     mtf = {}
-    for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+    for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240"), ("1D", "1d")]:
         try:
             tf_df = fetch_crypto_klines(symbol, interval, 150)
             mtf[tf_label] = simple_trend(tf_df)
@@ -1242,16 +1349,20 @@ async def score_symbol(symbol: str, asset_type="crypto"):
     if asset_type == "crypto":
         df = fetch_crypto_klines(symbol, "15", 150)
         mtf = {}
-        for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+        for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240"), ("1D", "1d")]:
             try:
                 tf_df = fetch_crypto_klines(symbol, interval, 150)
                 mtf[tf_label] = simple_trend(tf_df)
             except Exception:
                 mtf[tf_label] = "Unavailable"
-        return generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
+        meta = generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
+        meta["grade"] = grade_setup(meta, "crypto")
+        return meta
 
     df = fetch_twelvedata(symbol, asset_type)
-    return generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
+    meta = generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
+    meta["grade"] = grade_setup(meta, asset_type)
+    return meta
 
 
 
@@ -1506,33 +1617,13 @@ def get_active_premium_user_ids():
 
 
 async def automatic_vip_signal_check(context: ContextTypes.DEFAULT_TYPE):
-    if not AUTO_VIP_SIGNALS_ENABLED:
-        return
-    users = get_active_premium_user_ids()
-    if not users:
-        return
-    last_sent = load_json(AUTO_VIP_FILE, {})
-    current = now_utc()
-    for user_id in users:
-        last = parse_dt(last_sent.get(str(user_id)))
-        if last and current - last < timedelta(minutes=AUTO_VIP_SCAN_MINUTES):
-            continue
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="💎 Automatic VIP scan running. You do not need to press Get VIP Signals.",
-            )
-            await premium_signals(user_id, user_id, context)
-            last_sent[str(user_id)] = current.isoformat()
-            save_json(AUTO_VIP_FILE, last_sent)
-        except Exception as e:
-            logger.warning("Automatic VIP scan failed for %s: %s", user_id, e)
+    # Disabled by request: VIP signals scan only when a premium user requests them.
+    return
 
 
 async def maintenance_check(context: ContextTypes.DEFAULT_TYPE):
     await update_vip_results(context)
     await premium_expiry_reminder_check(context)
-    await automatic_vip_signal_check(context)
 
 async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
@@ -1540,17 +1631,13 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         await show_premium(chat_id, user_id, context)
         return
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🔎 Scanning crypto, forex and stocks for premium setups..."
-    )
-
+    # Scan only after user request. Keep quiet if no A/A+ setup is found.
     candidates = []
 
     for symbol in CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT]:
         try:
             meta = await score_symbol(symbol, "crypto")
-            if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
+            if is_a_plus_setup(meta, "crypto"):
                 meta["asset_type"] = "crypto"
                 candidates.append(meta)
         except Exception as e:
@@ -1560,7 +1647,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         for symbol in FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT]:
             try:
                 meta = await score_symbol(symbol, "forex")
-                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
+                if is_a_plus_setup(meta, "forex"):
                     meta["asset_type"] = "forex"
                     candidates.append(meta)
             except Exception as e:
@@ -1569,38 +1656,27 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         for symbol in STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT]:
             try:
                 meta = await score_symbol(symbol, "stock")
-                if meta["confidence"] >= PREMIUM_MIN_CONFIDENCE and meta["direction"] != "WAIT":
+                if is_a_plus_setup(meta, "stock"):
                     meta["asset_type"] = "stock"
                     candidates.append(meta)
             except Exception as e:
                 logger.warning("Stock scan failed for %s: %s", symbol, e)
 
-    candidates = sorted(candidates, key=lambda x: x["confidence"], reverse=True)[:PREMIUM_DAILY_LIMIT]
+    candidates = sorted(
+        candidates,
+        key=lambda x: (x.get("grade") == "A+", x.get("confidence", 0), x.get("risk_reward", 0)),
+        reverse=True
+    )[:PREMIUM_DAILY_LIMIT]
 
     if not candidates:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "💎 *VIP Scan Complete*\n\n"
-                "No A-grade premium setup found right now.\n"
-                "This is good risk control — we do not force weak trades.\n\n"
-                "Try again later."
-            ),
-            parse_mode="Markdown",
-        )
+        # Do not send "no signal" message by request.
         return
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"💎 Found *{len(candidates)}* premium setup(s). Sending now...",
-        parse_mode="Markdown",
-    )
 
     for item in candidates:
         try:
             await send_analysis(chat_id, user_id, context, item["symbol"], item["asset_type"], premium=True)
         except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to send {item['symbol']}: {e}")
+            logger.warning("Failed to send premium signal %s: %s", item.get("symbol"), e)
 
 
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1618,17 +1694,19 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
         if premium:
             df = fetch_crypto_klines(symbol, "15", 150)
             mtf = {}
-            for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240")]:
+            for tf_label, interval in [("15m", "15"), ("1H", "60"), ("4H", "240"), ("1D", "1d")]:
                 try:
                     mtf[tf_label] = simple_trend(fetch_crypto_klines(symbol, interval, 150))
                 except Exception:
                     mtf[tf_label] = "Unavailable"
             meta = generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
+            meta["grade"] = grade_setup(meta, asset_type)
     elif asset_type in ["forex", "stock"]:
         df = fetch_twelvedata(symbol, asset_type)
         signal = generate_signal(df, symbol, mtf=None, vip=premium, lock_free=not premium)
         if premium:
             meta = generate_signal(df, symbol, mtf=None, vip=True, lock_free=False, return_meta=True)
+            meta["grade"] = grade_setup(meta, asset_type)
     else:
         raise ValueError("Asset type must be crypto, forex, or stock.")
 
@@ -1645,6 +1723,7 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
                     f"Symbol: `{order['symbol']}`\n"
                     f"Type: `{order['order_type']}`\n"
                     f"Lot Size: `{order['lot_size']}`\n"
+                    f"Grade: `{meta.get('grade', 'A')}`\n"
                     f"Entry: `{order['entry_price']:.6g}`\n"
                     f"SL: `{float(order['stop_loss']):.6g}`\n"
                     f"TP1: `{float(order['tp1']):.6g}`\n\n"
@@ -1714,11 +1793,11 @@ async def mt5link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users[uid] = profile
     save_mt5_users(users)
     await update.message.reply_text(
-        "✅ *MT5 Bridge Enabled*\n\n"
-        f"Bridge Code: `{code}`\n"
+        "✅ *MT5 EA Enabled*\n\n"
+        f"EA Code: `{code}`\n"
         f"Lot Size: `{profile.get('lot_size', 0.01)}`\n"
         f"Max Active Orders: `{MAX_ACTIVE_MT5_ORDERS}`\n\n"
-        "Keep your laptop, MT5, and MT5 Bridge running.\n"
+        "Keep MT5 open and attach the InfluencerTech EA to any chart.\n"
         "Use /setlot 0.01 to change lot size.\n"
         "Use /mt5off to disable auto orders.",
         parse_mode="Markdown",
@@ -1730,12 +1809,12 @@ async def mt5status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile = get_mt5_profile(update.effective_user.id)
     active_count = active_mt5_order_count(update.effective_user.id)
     if not profile:
-        await update.message.reply_text("MT5 Bridge is not linked. Use /mt5link first.")
+        await update.message.reply_text("MT5 EA is not linked. Use /mt5link first.")
         return
     await update.message.reply_text(
         "🤖 *MT5 Status*\n\n"
         f"Enabled: `{profile.get('enabled', False)}`\n"
-        f"Bridge Code: `{profile.get('bridge_code', 'None')}`\n"
+        f"EA Code: `{profile.get('bridge_code', 'None')}`\n"
         f"Lot Size: `{profile.get('lot_size', 0.01)}`\n"
         f"Active/Pending Orders: `{active_count}/{MAX_ACTIVE_MT5_ORDERS}`",
         parse_mode="Markdown",
@@ -1770,6 +1849,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     clean = text.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
+
+    if clean in ["GETSIGNAL", "GETVIP", "VIPSIGNAL", "SIGNAL"]:
+        await premium_signals(update.effective_chat.id, update.effective_user.id, context)
+        return
 
     crypto_shortcuts = [s.replace("USDT", "") for s in CRYPTO_WATCHLIST]
     forex_symbols = [s.replace("/", "") for s in FOREX_WATCHLIST]
@@ -1953,7 +2036,7 @@ async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 Daily VIP Limit: *{PREMIUM_DAILY_LIMIT}*\n"
         f"📊 VIP Min Confidence: *{PREMIUM_MIN_CONFIDENCE}%*\n"
         f"⚡ VIP Leverage Display: *{VIP_LEVERAGE:g}x*\n"
-        f"🤖 Auto VIP: *{AUTO_VIP_SIGNALS_ENABLED}* every *{AUTO_VIP_SCAN_MINUTES} min*\n"
+        f"🤖 Auto VIP: *Disabled - request only*\n"
         f"🧾 Max MT5 Orders/User: *{MAX_ACTIVE_MT5_ORDERS}*\n\n"
         f"🏃 Running Signals: *{running}*\n"
         f"✅ Wins: *{wins}*\n"

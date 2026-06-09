@@ -93,7 +93,8 @@ FREE_CONFIDENCE_LIMIT = int(os.getenv("FREE_CONFIDENCE_LIMIT", "80") or 80)
 PREMIUM_MIN_CONFIDENCE = int(os.getenv("PREMIUM_MIN_CONFIDENCE", "79") or 79)
 PREMIUM_DAILY_LIMIT = int(os.getenv("PREMIUM_DAILY_LIMIT", "5") or 5)
 PREMIUM_CRYPTO_SCAN_LIMIT = int(os.getenv("PREMIUM_CRYPTO_SCAN_LIMIT", "12") or 12)
-PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "8") or 8)
+PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "12") or 12)
+PREMIUM_METALS_SCAN_LIMIT = int(os.getenv("PREMIUM_METALS_SCAN_LIMIT", "4") or 4)
 PREMIUM_STOCK_SCAN_LIMIT = int(os.getenv("PREMIUM_STOCK_SCAN_LIMIT", "8") or 8)
 VIP_LEVERAGE = float(os.getenv("VIP_LEVERAGE", "10") or 10)
 AUTO_VIP_SIGNALS_ENABLED = os.getenv("AUTO_VIP_SIGNALS_ENABLED", "0").strip() == "1"
@@ -114,8 +115,15 @@ CRYPTO_WATCHLIST = [
 
 FOREX_WATCHLIST = [
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "NZD/USD",
-    "USD/CHF", "GBP/JPY", "EUR/JPY", "XAU/USD", "XAG/USD",
-    "EUR/GBP", "EUR/AUD", "AUD/JPY", "CAD/JPY", "CHF/JPY",
+    "USD/CHF", "GBP/JPY", "EUR/JPY", "EUR/GBP", "EUR/AUD", "AUD/JPY",
+    "CAD/JPY", "CHF/JPY", "GBP/CAD", "GBP/AUD", "EUR/CAD", "NZD/JPY",
+]
+
+METALS_WATCHLIST = [
+    "XAU/USD",  # Gold
+    "XAG/USD",  # Silver
+    "XPT/USD",  # Platinum
+    "XPD/USD",  # Palladium
 ]
 
 STOCK_WATCHLIST = [
@@ -126,6 +134,8 @@ STOCK_WATCHLIST = [
 YAHOO_SYMBOL_MAP = {
     "XAUUSD": "GC=F",
     "XAGUSD": "SI=F",
+    "XPTUSD": "PL=F",
+    "XPDUSD": "PA=F",
     "EURUSD": "EURUSD=X",
     "GBPUSD": "GBPUSD=X",
     "USDJPY": "JPY=X",
@@ -220,7 +230,15 @@ def leverage_pnl_percent(direction: str, entry: float, target: float):
 
 
 def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
-    """Queue a VIP signal for the user's laptop MT5 bridge. The laptop bridge pulls these orders."""
+    """
+    Queue a VIP signal for the user's laptop MT5 bridge.
+
+    IMPORTANT:
+    - BUY signals use BUY_LIMIT at the LOWER entry price.
+    - SELL signals use SELL_LIMIT at the UPPER entry price.
+    - Orders expire after 2 hours if not placed.
+    - This stops BTC/crypto from opening market orders when the user wants exact signal entry.
+    """
     if not is_mt5_linked(user_id):
         return {"queued": False, "reason": "MT5 not linked"}
 
@@ -233,7 +251,20 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
     if direction == "WAIT" or not ("BUY" in direction or "SELL" in direction):
         return {"queued": False, "reason": "Signal is WAIT/neutral"}
 
-    entry = (float(meta.get("entry_low")) + float(meta.get("entry_high"))) / 2
+    entry_low = float(meta.get("entry_low"))
+    entry_high = float(meta.get("entry_high"))
+
+    if "BUY" in direction:
+        order_type = "BUY_LIMIT"
+        entry = entry_low
+    elif "SELL" in direction:
+        order_type = "SELL_LIMIT"
+        entry = entry_high
+    else:
+        return {"queued": False, "reason": "Invalid direction"}
+
+    created_at = now_utc()
+    expires_at = created_at + timedelta(hours=2)
 
     order = {
         "order_id": make_order_id(user_id, meta.get("symbol")),
@@ -242,11 +273,11 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         "asset_type": asset_type,
         "symbol": meta.get("symbol"),
         "direction": direction,
-        "order_type": "MARKET_BUY" if "BUY" in direction else "MARKET_SELL" if "SELL" in direction else "NONE",
+        "order_type": order_type,
         "lot_size": mt5_lot_size(user_id),
         "entry_price": entry,
-        "entry_low": meta.get("entry_low"),
-        "entry_high": meta.get("entry_high"),
+        "entry_low": entry_low,
+        "entry_high": entry_high,
         "stop_loss": meta.get("stop_loss"),
         "tp1": meta.get("tp1"),
         "tp2": meta.get("tp2"),
@@ -258,8 +289,9 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         "sl_pnl_percent": round(leverage_pnl_percent(direction, entry, float(meta.get("stop_loss"))), 2),
         "confidence": meta.get("confidence"),
         "status": "PENDING_TO_BRIDGE",
-        "created_at": now_utc().isoformat(),
-        "updated_at": now_utc().isoformat(),
+        "created_at": created_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "updated_at": created_at.isoformat(),
     }
     orders = get_mt5_orders()
     orders.append(order)
@@ -1008,6 +1040,22 @@ def risk_reward_ratio(direction: str, entry: float, stop: float, target: float):
         return 0
 
 
+def signal_grade(confidence: int):
+    """Premium grading requested by owner."""
+    confidence = int(confidence or 0)
+    if confidence >= 90:
+        return "A+ SIGNAL"
+    if confidence >= 85:
+        return "A SIGNAL"
+    if confidence >= 79:
+        return "B SIGNAL"
+    return "NO VIP SIGNAL"
+
+
+def grade_rank(grade: str):
+    return {"A+ SIGNAL": 3, "A SIGNAL": 2, "B SIGNAL": 1}.get(grade, 0)
+
+
 def is_active_trading_session(asset_type: str):
     """Avoid low-liquidity hours for forex/stocks. Crypto remains allowed."""
     hour = now_utc().hour
@@ -1053,7 +1101,7 @@ def add_quality_fields(meta: dict, df: pd.DataFrame, asset_type: str, daily_tren
     meta["structure_confirmed"] = structure_is_strong(df)
 
     atr_min = 0.04 if asset_type == "forex" else 0.12 if asset_type == "crypto" else 0.08
-    aplus = (
+    aplus_quality = (
         meta.get("confidence", 0) >= A_PLUS_MIN_CONFIDENCE
         and meta.get("direction") != "WAIT"
         and direction_matches_trend(meta.get("direction", ""), daily_trend)
@@ -1062,7 +1110,8 @@ def add_quality_fields(meta: dict, df: pd.DataFrame, asset_type: str, daily_tren
         and meta["session_ok"]
         and meta["structure_confirmed"]
     )
-    meta["grade"] = "A+" if aplus else "B"
+    meta["grade"] = signal_grade(meta.get("confidence", 0))
+    meta["setup_quality"] = "A+ QUALITY" if aplus_quality else "STANDARD QUALITY"
     return meta
 
 
@@ -1285,6 +1334,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         return {
             "symbol": symbol.upper(),
             "confidence": confidence,
+            "grade": signal_grade(confidence),
             "rating": rating,
             "direction": direction,
             "risk": risk,
@@ -1363,7 +1413,8 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         f"Support: `{support:.6g}`\n"
         f"Resistance: `{resistance:.6g}`\n"
         f"Risk: *{risk}*\n"
-        f"Confidence: *{confidence}%*\n\n"
+        f"Confidence: *{confidence}%*\n"
+        f"Signal Grade: *{signal_grade(confidence)}*\n\n"
         f"📌 *SMC Analysis*\n"
         f"CHoCH/BOS: `{structure_text}`\n"
         f"FVG: `{fvg}`\n"
@@ -1683,48 +1734,68 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         await show_premium(chat_id, user_id, context)
         return
 
-    candidates = []
-
-    # Request-only scan. No automatic 24/7 scan and no "no setup" reply.
-    for symbol in CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT]:
-        try:
-            meta = await score_symbol(symbol, "crypto")
-            if meta.get("grade") == "A+" and meta["direction"] != "WAIT":
-                meta["asset_type"] = "crypto"
-                candidates.append(meta)
-        except Exception as e:
-            logger.warning("Crypto scan failed for %s: %s", symbol, e)
-
-    # Forex/stocks now use Yahoo Finance. Keep limits low through env if needed.
-    for symbol in FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT]:
-        try:
-            meta = await score_symbol(symbol, "forex")
-            if meta.get("grade") == "A+" and meta["direction"] != "WAIT":
-                meta["asset_type"] = "forex"
-                candidates.append(meta)
-        except Exception as e:
-            logger.warning("Forex scan failed for %s: %s", symbol, e)
-
-    for symbol in STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT]:
-        try:
-            meta = await score_symbol(symbol, "stock")
-            if meta.get("grade") == "A+" and meta["direction"] != "WAIT":
-                meta["asset_type"] = "stock"
-                candidates.append(meta)
-        except Exception as e:
-            logger.warning("Stock scan failed for %s: %s", symbol, e)
-
-    candidates = sorted(candidates, key=lambda x: (x.get("confidence", 0), x.get("risk_reward", 0)), reverse=True)[:PREMIUM_DAILY_LIMIT]
-
-    if not candidates:
-        # User requested silence when no good setup exists.
-        return
-
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"💎 Found *{len(candidates)}* A+ premium setup(s). Sending now...",
+        text=(
+            "🔎 *Scanning markets for best VIP signals...*\n\n"
+            "Checking:\n"
+            "• Crypto pairs\n"
+            "• Forex pairs\n"
+            "• Metals: Gold XAU/USD, Silver XAG/USD, Platinum XPT/USD, Palladium XPD/USD\n"
+            "• Stocks\n\n"
+            "Only *79%+ confidence* setups will be sent:\n"
+            "*79-84% = B SIGNAL*\n"
+            "*85-89% = A SIGNAL*\n"
+            "*90%+ = A+ SIGNAL*"
+        ),
         parse_mode="Markdown",
     )
+
+    candidates = []
+
+    async def scan_list(symbols, asset_type, label):
+        found = []
+        for symbol in symbols:
+            try:
+                meta = await score_symbol(symbol, asset_type)
+                if meta.get("direction") != "WAIT" and int(meta.get("confidence", 0)) >= PREMIUM_MIN_CONFIDENCE:
+                    meta["asset_type"] = asset_type
+                    meta["market_group"] = label
+                    meta["grade"] = signal_grade(meta.get("confidence", 0))
+                    found.append(meta)
+            except Exception as e:
+                logger.warning("%s scan failed for %s: %s", label, symbol, e)
+        return found
+
+    candidates.extend(await scan_list(CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT], "crypto", "Crypto"))
+    candidates.extend(await scan_list(METALS_WATCHLIST[:PREMIUM_METALS_SCAN_LIMIT], "forex", "Metals"))
+    candidates.extend(await scan_list(FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT], "forex", "Forex"))
+    candidates.extend(await scan_list(STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT], "stock", "Stocks"))
+
+    candidates = sorted(
+        candidates,
+        key=lambda x: (grade_rank(x.get("grade")), x.get("confidence", 0), x.get("risk_reward", 0)),
+        reverse=True,
+    )[:PREMIUM_DAILY_LIMIT]
+
+    if not candidates:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ No 79%+ VIP setup found right now.\n\n"
+                "The bot scanned crypto, forex, metals and stocks but did not find a strong enough entry. "
+                "Try again later or wait for market confirmation."
+            ),
+        )
+        return
+
+    summary_lines = ["💎 *Best VIP setups found:*\n"]
+    for item in candidates:
+        summary_lines.append(
+            f"{item.get('grade')} — `{item['symbol']}` {item.get('direction')} "
+            f"| Confidence: *{item.get('confidence')}%* | {item.get('market_group')}"
+        )
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(summary_lines), parse_mode="Markdown")
 
     for item in candidates:
         try:
@@ -1780,10 +1851,11 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
                     f"Symbol: `{order['symbol']}`\n"
                     f"Type: `{order['order_type']}`\n"
                     f"Lot Size: `{order['lot_size']}`\n"
-                    f"Entry: `{order['entry_price']:.6g}`\n"
+                    f"Exact Entry: `{order['entry_price']:.6g}`\n"
                     f"SL: `{float(order['stop_loss']):.6g}`\n"
-                    f"TP1: `{float(order['tp1']):.6g}`\n\n"
-                    "Keep MT5 open and the InfluencerTech EA attached to any chart."
+                    f"TP1: `{float(order['tp1']):.6g}`\n"
+                    f"Expires: `{parse_dt(order['expires_at']).strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
+                    "Keep MT5 open. The EA should place this as a pending limit order, not market."
                 ),
                 parse_mode="Markdown",
             )
@@ -1907,7 +1979,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean = text.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
 
     crypto_shortcuts = [s.replace("USDT", "") for s in CRYPTO_WATCHLIST]
-    forex_symbols = [s.replace("/", "") for s in FOREX_WATCHLIST]
+    forex_symbols = [s.replace("/", "") for s in (FOREX_WATCHLIST + METALS_WATCHLIST)]
     stock_symbols = STOCK_WATCHLIST
 
     if clean in crypto_shortcuts:
@@ -2084,6 +2156,7 @@ async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💎 Premium Users: *{len(premium)}*\n"
         f"📈 Crypto Scan Limit: *{PREMIUM_CRYPTO_SCAN_LIMIT}*\n"
         f"💱 Forex Scan Limit: *{PREMIUM_FOREX_SCAN_LIMIT}*\n"
+        f"🥇 Metals Scan Limit: *{PREMIUM_METALS_SCAN_LIMIT}*\n"
         f"🏛 Stock Scan Limit: *{PREMIUM_STOCK_SCAN_LIMIT}*\n"
         f"🎯 Daily VIP Limit: *{PREMIUM_DAILY_LIMIT}*\n"
         f"📊 VIP Min Confidence: *{PREMIUM_MIN_CONFIDENCE}%*\n"

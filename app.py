@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import json
 
 import requests
 from dotenv import load_dotenv
@@ -61,10 +62,14 @@ givepremium = bot_module.givepremium
 vip_history_command = bot_module.vip_history_command
 vip_performance_command = bot_module.vip_performance_command
 adminstats = getattr(bot_module, "adminstats", fallback_adminstats)
+
 setlot = getattr(bot_module, "setlot", None)
 mt5link = getattr(bot_module, "mt5link", None)
 mt5status = getattr(bot_module, "mt5status", None)
 mt5off = getattr(bot_module, "mt5off", None)
+clearmt5 = getattr(bot_module, "clearmt5", None)
+mt5queue = getattr(bot_module, "mt5queue", None)
+
 button_click = bot_module.button_click
 text_handler = bot_module.text_handler
 scheduled_news_check = bot_module.scheduled_news_check
@@ -90,6 +95,11 @@ if mt5status:
     telegram_app.add_handler(CommandHandler("mt5status", mt5status))
 if mt5off:
     telegram_app.add_handler(CommandHandler("mt5off", mt5off))
+if clearmt5:
+    telegram_app.add_handler(CommandHandler("clearmt5", clearmt5))
+if mt5queue:
+    telegram_app.add_handler(CommandHandler("mt5queue", mt5queue))
+
 telegram_app.add_handler(CallbackQueryHandler(button_click))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -128,23 +138,27 @@ def set_webhook():
     response = requests.post(url, json={"url": webhook_url}, timeout=20)
 
     try:
-        loop.run_until_complete(
-            telegram_app.bot.set_my_commands([
-                BotCommand("start", "Open main menu"),
-                BotCommand("analyze", "Analyze crypto, forex or stock"),
-                BotCommand("news", "Check market news alerts"),
-                BotCommand("premium", "Get premium VIP signals"),
-                BotCommand("viphistory", "View VIP signal history"),
-                BotCommand("vipperformance", "View VIP win/loss performance"),
-                BotCommand("adminstats", "Admin dashboard"),
-                BotCommand("setlot", "Set MT5 lot size"),
-                BotCommand("mt5link", "Enable MT5 bridge"),
-                BotCommand("mt5status", "MT5 bridge status"),
-                BotCommand("mt5off", "Disable MT5 auto orders"),
-                BotCommand("broadcast", "Admin broadcast message"),
-                BotCommand("givepremium", "Admin activate premium manually"),
-            ])
-        )
+        commands = [
+            BotCommand("start", "Open main menu"),
+            BotCommand("analyze", "Analyze crypto, forex or stock"),
+            BotCommand("news", "Check market news alerts"),
+            BotCommand("premium", "Get premium VIP signals"),
+            BotCommand("viphistory", "View VIP signal history"),
+            BotCommand("vipperformance", "View VIP win/loss performance"),
+            BotCommand("adminstats", "Admin dashboard"),
+            BotCommand("setlot", "Set MT5 lot size"),
+            BotCommand("mt5link", "Enable MT5 EA"),
+            BotCommand("mt5status", "MT5 EA status"),
+            BotCommand("mt5off", "Disable MT5 auto orders"),
+            BotCommand("broadcast", "Admin broadcast message"),
+            BotCommand("givepremium", "Admin activate premium manually"),
+        ]
+        if mt5queue:
+            commands.append(BotCommand("mt5queue", "View MT5 queue"))
+        if clearmt5:
+            commands.append(BotCommand("clearmt5", "Clear MT5 queue"))
+
+        loop.run_until_complete(telegram_app.bot.set_my_commands(commands))
         menu_status = "Telegram command menu added successfully"
     except Exception as e:
         logger.warning("set_my_commands failed: %s", e)
@@ -177,10 +191,10 @@ def check_news():
 
 @app.get("/mt5_orders")
 def mt5_orders():
-    """Laptop MT5 Bridge pulls queued orders using ?code=BRIDGE_CODE."""
+    """MT5 EA pulls queued orders using ?code=EA_CODE."""
     code = request.args.get("code", "").strip()
     if not code:
-        return jsonify({"ok": False, "error": "Missing bridge code"}), 400
+        return jsonify({"ok": False, "error": "Missing EA code"}), 400
 
     orders = bot_module.load_json(bot_module.MT5_ORDERS_FILE, [])
     pending = [
@@ -190,18 +204,60 @@ def mt5_orders():
     return jsonify({"ok": True, "orders": pending[:10]})
 
 
+def _parse_mt5_status_payload():
+    """
+    MT5 WebRequest sometimes sends malformed JSON with an extra trailing NULL.
+    This parser logs raw data and recovers the first valid JSON object.
+    """
+    raw = request.get_data(as_text=True) or ""
+    logger.info("MT5 STATUS RAW: %r", raw)
+
+    data = request.get_json(force=True, silent=True)
+    if isinstance(data, dict):
+        return data, raw, None
+
+    cleaned = raw.strip().replace("\x00", "")
+    if not cleaned:
+        return None, raw, "Empty request body"
+
+    try:
+        return json.loads(cleaned), raw, None
+    except Exception:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.find("}", start)
+    if start >= 0 and end > start:
+        candidate = cleaned[start:end + 1]
+        try:
+            return json.loads(candidate), raw, None
+        except Exception as e:
+            return None, raw, f"Invalid JSON after recovery: {e}"
+
+    return None, raw, "Invalid JSON body"
+
+
 @app.post("/mt5_order_status")
 def mt5_order_status():
-    """Laptop MT5 Bridge reports order status after placing/closing."""
+    """MT5 EA reports order status after placing/skipping/failing."""
     try:
-        data = request.get_json(force=True)
+        data, raw, parse_error = _parse_mt5_status_payload()
+        if not data:
+            logger.warning("MT5 status payload invalid: %s raw=%r", parse_error, raw)
+            return jsonify({"ok": False, "error": parse_error, "raw": raw}), 400
+
         code = str(data.get("code", "")).strip()
         order_id = str(data.get("order_id", "")).strip()
         status = str(data.get("status", "")).strip().upper()
         ticket = data.get("ticket")
+        error = data.get("error") or data.get("err") or ""
 
         if not code or not order_id or not status:
-            return jsonify({"ok": False, "error": "code, order_id and status are required"}), 400
+            return jsonify({
+                "ok": False,
+                "error": "code, order_id and status are required",
+                "received": data,
+            }), 400
 
         orders = bot_module.load_json(bot_module.MT5_ORDERS_FILE, [])
         updated = False
@@ -209,10 +265,17 @@ def mt5_order_status():
             if order.get("bridge_code") == code and order.get("order_id") == order_id:
                 order["status"] = status
                 order["mt5_ticket"] = ticket
+                order["error"] = error
                 order["updated_at"] = bot_module.now_utc().isoformat()
                 updated = True
                 break
+
         bot_module.save_json(bot_module.MT5_ORDERS_FILE, orders)
+        logger.info(
+            "MT5 order status updated=%s order_id=%s status=%s ticket=%s error=%s",
+            updated, order_id, status, ticket, error,
+        )
+
         return jsonify({"ok": True, "updated": updated})
     except Exception as e:
         logger.exception("MT5 status update error")

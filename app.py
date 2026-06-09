@@ -191,16 +191,44 @@ def check_news():
 
 @app.get("/mt5_orders")
 def mt5_orders():
-    """MT5 EA pulls queued orders using ?code=EA_CODE."""
+    """MT5 EA pulls queued pending limit orders using ?code=EA_CODE."""
     code = request.args.get("code", "").strip()
     if not code:
         return jsonify({"ok": False, "error": "Missing EA code"}), 400
 
+    now = bot_module.now_utc()
     orders = bot_module.load_json(bot_module.MT5_ORDERS_FILE, [])
-    pending = [
-        o for o in orders
-        if o.get("bridge_code") == code and o.get("status") == "PENDING_TO_BRIDGE"
-    ]
+    changed = False
+    pending = []
+
+    for o in orders:
+        if o.get("bridge_code") != code or o.get("status") != "PENDING_TO_BRIDGE":
+            continue
+
+        expires = bot_module.parse_dt(o.get("expires_at")) if hasattr(bot_module, "parse_dt") else None
+        if expires and expires <= now:
+            o["status"] = "EXPIRED"
+            o["error"] = "Expired after 2 hours before EA placed it"
+            o["updated_at"] = now.isoformat()
+            changed = True
+            continue
+
+        # Safety fallback for older queued orders that were created before this update.
+        direction = str(o.get("direction", "")).upper()
+        if o.get("order_type") in ["MARKET_BUY", "MARKET_SELL"]:
+            if "BUY" in direction:
+                o["order_type"] = "BUY_LIMIT"
+                o["entry_price"] = float(o.get("entry_low") or o.get("entry_price"))
+            elif "SELL" in direction:
+                o["order_type"] = "SELL_LIMIT"
+                o["entry_price"] = float(o.get("entry_high") or o.get("entry_price"))
+            changed = True
+
+        pending.append(o)
+
+    if changed:
+        bot_module.save_json(bot_module.MT5_ORDERS_FILE, orders)
+
     return jsonify({"ok": True, "orders": pending[:10]})
 
 

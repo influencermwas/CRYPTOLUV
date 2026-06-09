@@ -566,7 +566,15 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "4. Wait for confirmation before entry.",
             reply_markup=main_menu(),
         )
+async def clearmt5(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
 
+    save_json(MT5_ORDERS_FILE, [])
+
+    await update.message.reply_text(
+        "✅ MT5 order queue cleared."
+    )
 
 async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)

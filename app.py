@@ -58,6 +58,7 @@ analyze = bot_module.analyze
 news_command = bot_module.news_command
 broadcast = bot_module.broadcast
 premium_command = bot_module.premium_command
+referral_command = getattr(bot_module, "referral_command", None)
 givepremium = bot_module.givepremium
 vip_history_command = bot_module.vip_history_command
 vip_performance_command = bot_module.vip_performance_command
@@ -82,6 +83,9 @@ telegram_app.add_handler(CommandHandler("analyze", analyze))
 telegram_app.add_handler(CommandHandler("news", news_command))
 telegram_app.add_handler(CommandHandler("broadcast", broadcast))
 telegram_app.add_handler(CommandHandler("premium", premium_command))
+if referral_command:
+    telegram_app.add_handler(CommandHandler("referral", referral_command))
+    telegram_app.add_handler(CommandHandler("referrals", referral_command))
 telegram_app.add_handler(CommandHandler("givepremium", givepremium))
 telegram_app.add_handler(CommandHandler("viphistory", vip_history_command))
 telegram_app.add_handler(CommandHandler("vipperformance", vip_performance_command))
@@ -143,6 +147,7 @@ def set_webhook():
             BotCommand("analyze", "Analyze crypto, forex or stock"),
             BotCommand("news", "Check market news alerts"),
             BotCommand("premium", "Get premium VIP signals"),
+            BotCommand("referral", "Open referral dashboard"),
             BotCommand("viphistory", "View VIP signal history"),
             BotCommand("vipperformance", "View VIP win/loss performance"),
             BotCommand("adminstats", "Admin dashboard"),

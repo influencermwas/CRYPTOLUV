@@ -42,6 +42,8 @@ USERS_FILE = "users.json"
 NEWS_FILE = "seen_news.json"
 PREMIUM_FILE = "premium_users.json"
 PENDING_FILE = "pending_payments.json"
+REFERRALS_FILE = "referrals.json"
+REFERRAL_REWARD_HOURS = int(os.getenv("REFERRAL_REWARD_HOURS", "24") or 24)
 MT5_USERS_FILE = "mt5_users.json"
 MT5_ORDERS_FILE = "mt5_orders.json"
 AUTO_VIP_FILE = "auto_vip_last_sent.json"
@@ -304,7 +306,7 @@ def format_premium_signal_from_meta(meta: dict):
     return (
         f"💎 *VIP PREMIUM SIGNAL*\n"
         f"📊 *{symbol} Signal*\n"
-        f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+        f"🔥 *CRYPTO LUV SIGNALS* 🔥\n\n"
         f"Rating: *{rating}*\n"
         f"Direction: *{direction}*\n"
         f"Current Price: `{current:.6g}`\n"
@@ -332,7 +334,7 @@ def format_premium_signal_from_meta(meta: dict):
         f"MTF Trend: `{mtf_text}`\n\n"
         "Reason:\n- " + "\n- ".join(reasons[:12]) +
         "\n\n━━━━━━━━━━━━━━━━━━\n"
-        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n"
+        "🔥 *CRYPTO LUV SIGNALS* 🔥\n"
         "⚠️ This is analysis only, not guaranteed profit."
     )
 
@@ -457,6 +459,150 @@ def register_user(user_id: int):
         users.append(user_id)
         save_json(USERS_FILE, users)
     return is_new
+
+def load_referrals():
+    data = load_json(REFERRALS_FILE, {})
+    data.setdefault("referred_by", {})
+    data.setdefault("referrals", {})
+    data.setdefault("premium_rewards", {})
+    return data
+
+
+def save_referrals(data):
+    data.setdefault("referred_by", {})
+    data.setdefault("referrals", {})
+    data.setdefault("premium_rewards", {})
+    save_json(REFERRALS_FILE, data)
+
+
+def record_referral(user_id: int, referrer_id: int):
+    """Save referral once. Does not allow self-referral or changing referrer."""
+    if not referrer_id or int(user_id) == int(referrer_id):
+        return False
+
+    data = load_referrals()
+    uid = str(user_id)
+    rid = str(referrer_id)
+
+    if uid in data["referred_by"]:
+        return False
+
+    data["referred_by"][uid] = rid
+    data["referrals"].setdefault(rid, [])
+    if uid not in data["referrals"][rid]:
+        data["referrals"][rid].append(uid)
+
+    save_referrals(data)
+    return True
+
+
+def get_referrer(user_id: int):
+    data = load_referrals()
+    referrer = data.get("referred_by", {}).get(str(user_id))
+    try:
+        return int(referrer) if referrer else None
+    except Exception:
+        return None
+
+
+def referral_stats(user_id: int):
+    data = load_referrals()
+    uid = str(user_id)
+    referred = data.get("referrals", {}).get(uid, [])
+    rewarded_users = data.get("premium_rewards", {})
+    premium_count = sum(1 for child in referred if rewarded_users.get(str(child)) == uid)
+    return {
+        "total_referrals": len(referred),
+        "premium_referrals": premium_count,
+        "premium_days_earned": premium_count,
+    }
+
+
+def mark_referral_rewarded(referred_user_id: int, referrer_id: int):
+    data = load_referrals()
+    uid = str(referred_user_id)
+    rid = str(referrer_id)
+    if data.get("premium_rewards", {}).get(uid):
+        return False
+    data.setdefault("premium_rewards", {})[uid] = rid
+    save_referrals(data)
+    return True
+
+
+def extend_premium(user_id: int, hours=24, source="referral_reward"):
+    active, expires = is_premium(user_id)
+    base = expires if active and expires and expires > now_utc() else now_utc()
+    new_expires = base + timedelta(hours=hours)
+
+    if USE_SUPABASE:
+        payload = {
+            "user_id": str(user_id),
+            "expires_at": new_expires.isoformat(),
+            "source": source,
+            "remind_6h_sent": False,
+            "remind_1h_sent": False,
+            "expired_notice_sent": False,
+            "updated_at": now_utc().isoformat(),
+        }
+        sb_upsert(PREMIUM_TABLE, payload)
+
+    premium = load_json(PREMIUM_FILE, {})
+    premium[str(user_id)] = new_expires.isoformat()
+    save_json(PREMIUM_FILE, premium)
+    return new_expires
+
+
+async def reward_referrer_if_needed(referred_user_id: int, bot):
+    referrer_id = get_referrer(referred_user_id)
+    if not referrer_id:
+        return False
+    if not mark_referral_rewarded(referred_user_id, referrer_id):
+        return False
+
+    expires = extend_premium(referrer_id, REFERRAL_REWARD_HOURS, source="referral_reward")
+    try:
+        await bot.send_message(
+            chat_id=referrer_id,
+            text=(
+                "🎉 *Referral Reward!*\n\n"
+                "Someone you invited activated Premium.\n\n"
+                f"Reward: *+{REFERRAL_REWARD_HOURS // 24 if REFERRAL_REWARD_HOURS % 24 == 0 else REFERRAL_REWARD_HOURS} {'day' if REFERRAL_REWARD_HOURS == 24 else 'hours'} Premium*\n"
+                f"New expiry: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`"
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Failed to notify referrer %s: %s", referrer_id, e)
+    return True
+
+
+async def send_referral_dashboard(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    stats = referral_stats(user_id)
+    try:
+        me = await context.bot.get_me()
+        username = me.username
+    except Exception:
+        username = os.getenv("BOT_USERNAME", "YOUR_BOT_USERNAME").replace("@", "")
+
+    link = f"https://t.me/{username}?start={user_id}"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "👥 *REFERRAL DASHBOARD*\n\n"
+            f"Total Referrals: *{stats['total_referrals']}*\n"
+            f"Premium Referrals: *{stats['premium_referrals']}*\n"
+            f"Premium Days Earned: *{stats['premium_days_earned']}*\n\n"
+            "🎁 Reward: when your referral buys Premium, you get *+1 day Premium*.\n\n"
+            "Your Referral Link:\n"
+            f"`{link}`"
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user.id)
+    await send_referral_dashboard(update.effective_chat.id, update.effective_user.id, context)
 
 
 def get_premium_row(user_id: int):
@@ -591,6 +737,7 @@ def main_menu():
             InlineKeyboardButton("⚡ DOGE", callback_data="quick_DOGEUSDT"),
         ],
         [InlineKeyboardButton("💎 Premium Signals", callback_data="premium")],
+        [InlineKeyboardButton("👥 Referral Program", callback_data="referral")],
         [
             InlineKeyboardButton("📜 VIP History", callback_data="vip_history"),
             InlineKeyboardButton("📊 VIP Performance", callback_data="vip_performance"),
@@ -603,6 +750,11 @@ def main_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
+    if context.args:
+        try:
+            record_referral(update.effective_user.id, int(context.args[0]))
+        except Exception:
+            pass
 
     if not await has_required_access(update.effective_user.id, context):
         await send_access_gate(update.effective_chat.id, context)
@@ -655,6 +807,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_analysis(query.message.chat_id, query.from_user.id, context, symbol, "crypto", premium=False)
     elif data == "premium":
         await show_premium(query.message.chat_id, query.from_user.id, context)
+    elif data == "referral":
+        await send_referral_dashboard(query.message.chat_id, query.from_user.id, context)
     elif data == "vip_signal":
         await premium_signals(query.message.chat_id, query.from_user.id, context)
     elif data == "pay_premium":
@@ -859,6 +1013,7 @@ async def handle_mpesa_callback(data: dict, bot):
             ),
             parse_mode="Markdown",
         )
+        await reward_referrer_if_needed(user_id, bot)
         return {"ok": True, "message": "Premium activated"}
 
     pending.pop(checkout_id, None)
@@ -2306,6 +2461,7 @@ def main():
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("premium", premium_command))
+    app.add_handler(CommandHandler("referral", referral_command))
     app.add_handler(CommandHandler("givepremium", givepremium))
     app.add_handler(CommandHandler("viphistory", vip_history_command))
     app.add_handler(CommandHandler("vipperformance", vip_performance_command))

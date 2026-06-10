@@ -304,7 +304,7 @@ def format_premium_signal_from_meta(meta: dict):
     return (
         f"💎 *VIP PREMIUM SIGNAL*\n"
         f"📊 *{symbol} Signal*\n"
-        f"🔥 *CRYPTO LUV SIGNALS* 🔥\n\n"
+        f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
         f"Rating: *{rating}*\n"
         f"Direction: *{direction}*\n"
         f"Current Price: `{current:.6g}`\n"
@@ -332,7 +332,7 @@ def format_premium_signal_from_meta(meta: dict):
         f"MTF Trend: `{mtf_text}`\n\n"
         "Reason:\n- " + "\n- ".join(reasons[:12]) +
         "\n\n━━━━━━━━━━━━━━━━━━\n"
-        "🔥 *CRYPTO LUV SIGNALS* 🔥\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n"
         "⚠️ This is analysis only, not guaranteed profit."
     )
 

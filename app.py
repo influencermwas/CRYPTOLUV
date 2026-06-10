@@ -64,6 +64,7 @@ vip_performance_command = bot_module.vip_performance_command
 adminstats = getattr(bot_module, "adminstats", fallback_adminstats)
 
 setlot = getattr(bot_module, "setlot", None)
+setmaxtrades = getattr(bot_module, "setmaxtrades", None)
 mt5link = getattr(bot_module, "mt5link", None)
 mt5status = getattr(bot_module, "mt5status", None)
 mt5off = getattr(bot_module, "mt5off", None)
@@ -89,6 +90,8 @@ telegram_app.add_handler(CommandHandler("adminstats", adminstats))
 
 if setlot:
     telegram_app.add_handler(CommandHandler("setlot", setlot))
+if setmaxtrades:
+    telegram_app.add_handler(CommandHandler("setmaxtrades", setmaxtrades))
 if mt5link:
     telegram_app.add_handler(CommandHandler("mt5link", mt5link))
 if mt5status:
@@ -147,6 +150,7 @@ def set_webhook():
             BotCommand("vipperformance", "View VIP win/loss performance"),
             BotCommand("adminstats", "Admin dashboard"),
             BotCommand("setlot", "Set MT5 lot size"),
+            BotCommand("setmaxtrades", "Set max MT5 open trades"),
             BotCommand("mt5link", "Enable MT5 EA"),
             BotCommand("mt5status", "MT5 EA status"),
             BotCommand("mt5off", "Disable MT5 auto orders"),

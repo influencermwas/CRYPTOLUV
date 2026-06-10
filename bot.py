@@ -215,6 +215,16 @@ def mt5_lot_size(user_id: int):
     return max(0.01, lot)
 
 
+def mt5_max_trades(user_id: int):
+    """Per-user MT5 open trade limit. Defaults to MAX_ACTIVE_MT5_ORDERS."""
+    profile = get_mt5_profile(user_id)
+    try:
+        value = int(profile.get("max_active_orders", MAX_ACTIVE_MT5_ORDERS))
+    except Exception:
+        value = MAX_ACTIVE_MT5_ORDERS
+    return max(1, min(value, 50))
+
+
 def leverage_pnl_percent(direction: str, entry: float, target: float):
     if not entry:
         return 0.0
@@ -247,45 +257,83 @@ def grade_icon(grade: str):
 
 
 def format_premium_signal_from_meta(meta: dict):
+    """Detailed VIP format. Keeps full SMC analysis instead of compressed summary."""
     symbol = meta.get("symbol", "UNKNOWN")
-    asset_type = str(meta.get("asset_type", "market")).upper()
     confidence = int(meta.get("confidence", 0) or 0)
     grade = meta.get("grade") or premium_grade(confidence)
     direction = meta.get("direction", "WAIT")
+    rating = meta.get("rating", "")
+    risk = meta.get("risk", "Medium")
+
     entry_low = float(meta.get("entry_low", 0) or 0)
     entry_high = float(meta.get("entry_high", 0) or 0)
-    entry_mid = (entry_low + entry_high) / 2 if entry_low and entry_high else float(meta.get("current_price", 0) or 0)
+    current = float(meta.get("current_price", 0) or 0)
+    entry_mid = (entry_low + entry_high) / 2 if entry_low and entry_high else current
     stop = float(meta.get("stop_loss", 0) or 0)
     tp1 = float(meta.get("tp1", 0) or 0)
     tp2 = float(meta.get("tp2", 0) or 0)
     tp3 = float(meta.get("tp3", 0) or 0)
+    support = float(meta.get("support", 0) or 0)
+    resistance = float(meta.get("resistance", 0) or 0)
 
     tp1_pnl = leverage_pnl_percent(direction, entry_mid, tp1) if entry_mid and tp1 else 0
     tp2_pnl = leverage_pnl_percent(direction, entry_mid, tp2) if entry_mid and tp2 else 0
     tp3_pnl = leverage_pnl_percent(direction, entry_mid, tp3) if entry_mid and tp3 else 0
     sl_pnl = leverage_pnl_percent(direction, entry_mid, stop) if entry_mid and stop else 0
 
+    rr = float(meta.get("risk_reward", 0) or 0)
+    if rr <= 0:
+        rr = risk_reward_ratio(direction, entry_mid, stop, tp2)
+
+    structure_text = meta.get("structure_text") or meta.get("choch_bos") or "No fresh BOS/CHoCH"
+    fvg = meta.get("fvg") or "No clear FVG"
+    order_block = meta.get("order_block") or "No clear order block"
+    liquidity = meta.get("liquidity") or "No clear liquidity sweep"
+    mtf_text = meta.get("mtf_text") or "Not available"
+    reasons = meta.get("reasons") or []
+    if not reasons:
+        reasons = [
+            str(x) for x in [
+                structure_text,
+                fvg,
+                liquidity,
+                f"Multi-timeframe trend: {mtf_text}",
+            ] if x
+        ]
+
     return (
-        f"{grade_icon(grade)} *{grade}*\n"
-        f"💎 *CRYPTO LUV PREMIUM SIGNAL*\n\n"
-        f"Market: *{asset_type}*\n"
-        f"Symbol: `{symbol}`\n"
+        f"💎 *VIP PREMIUM SIGNAL*\n"
+        f"📊 *{symbol} Signal*\n"
+        f"🔥 *CRYPTO LUV SIGNALS* 🔥\n\n"
+        f"Rating: *{rating}*\n"
         f"Direction: *{direction}*\n"
-        f"Confidence: *{confidence}%*\n"
-        f"Risk: *{meta.get('risk', 'Medium')}*\n"
-        f"Risk Reward: `1:{float(meta.get('risk_reward', 0) or 0):.2f}`\n\n"
-        f"Current Price: `{float(meta.get('current_price', 0) or 0):.6g}`\n"
+        f"Current Price: `{current:.6g}`\n"
         f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
         f"Stop Loss: `{stop:.6g}`\n"
-        f"Take Profit 1: `{tp1:.6g}` `({tp1_pnl:+.2f}% @ {VIP_LEVERAGE:g}x)`\n"
-        f"Take Profit 2: `{tp2:.6g}` `({tp2_pnl:+.2f}% @ {VIP_LEVERAGE:g}x)`\n"
-        f"Take Profit 3: `{tp3:.6g}` `({tp3_pnl:+.2f}% @ {VIP_LEVERAGE:g}x)`\n"
-        f"SL Risk: `{sl_pnl:+.2f}% @ {VIP_LEVERAGE:g}x`\n\n"
-        f"Daily Trend: `{meta.get('daily_trend', 'Mixed')}`\n"
-        f"ATR: `{float(meta.get('atr_percent', 0) or 0):.3f}%`\n"
-        f"Structure Confirmed: `{meta.get('structure_confirmed', False)}`\n"
-        f"Session OK: `{meta.get('session_ok', True)}`\n\n"
-        "⚠️ Analysis only. Use proper risk management and stop loss."
+        f"Take Profit 1: `{tp1:.6g}`\n"
+        f"Take Profit 2: `{tp2:.6g}`\n"
+        f"Take Profit 3: `{tp3:.6g}`\n"
+        f"Risk Reward: `Approx 1:{rr:.2f}`\n\n"
+        f"📈 *{VIP_LEVERAGE:g}x Futures PnL Projection*\n"
+        f"TP1 Profit: `{tp1_pnl:+.2f}%`\n"
+        f"TP2 Profit: `{tp2_pnl:+.2f}%`\n"
+        f"TP3 Profit: `{tp3_pnl:+.2f}%`\n"
+        f"SL Risk: `{sl_pnl:+.2f}%`\n\n"
+        f"Support: `{support:.6g}`\n"
+        f"Resistance: `{resistance:.6g}`\n"
+        f"Risk: *{risk}*\n"
+        f"Confidence: *{confidence}%*\n"
+        f"Signal Grade: *{grade}*\n\n"
+        f"📌 *SMC Analysis*\n"
+        f"CHoCH/BOS: `{structure_text}`\n"
+        f"FVG: `{fvg}`\n"
+        f"Order Block: `{order_block}`\n"
+        f"Liquidity: `{liquidity}`\n"
+        f"MTF Trend: `{mtf_text}`\n\n"
+        "Reason:\n- " + "\n- ".join(reasons[:12]) +
+        "\n\n━━━━━━━━━━━━━━━━━━\n"
+        "🔥 *CRYPTO LUV SIGNALS* 🔥\n"
+        "⚠️ This is analysis only, not guaranteed profit."
     )
 
 
@@ -295,8 +343,9 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         return {"queued": False, "reason": "MT5 not linked"}
 
     active_count = active_mt5_order_count(user_id)
-    if active_count >= MAX_ACTIVE_MT5_ORDERS:
-        return {"queued": False, "reason": f"Maximum {MAX_ACTIVE_MT5_ORDERS} active MT5 orders reached"}
+    max_trades = mt5_max_trades(user_id)
+    if active_count >= max_trades:
+        return {"queued": False, "reason": f"Maximum {max_trades} active MT5 orders reached"}
 
     profile = get_mt5_profile(user_id)
     direction = meta.get("direction", "")
@@ -1369,6 +1418,12 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
             "support": support,
             "resistance": resistance,
             "leverage_used_for_display": VIP_LEVERAGE,
+            "structure_text": structure_text,
+            "fvg": fvg,
+            "order_block": order_block,
+            "liquidity": liquidity,
+            "mtf_text": mtf_text,
+            "reasons": reasons[:12],
             "created_at": now_utc().isoformat(),
         }
 
@@ -1953,6 +2008,31 @@ async def setlot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Invalid lot size. Example: /setlot 0.01\nError: {e}")
 
 
+
+async def setmaxtrades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow each MT5 user to choose their own max active/pending orders."""
+    register_user(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Use: /setmaxtrades 10\nExample: /setmaxtrades 6")
+        return
+    try:
+        max_trades = int(context.args[0])
+        if max_trades < 1 or max_trades > 50:
+            raise ValueError("Choose a number from 1 to 50")
+        users = get_mt5_users()
+        uid = str(update.effective_user.id)
+        profile = users.get(uid, {})
+        profile["max_active_orders"] = max_trades
+        profile.setdefault("enabled", False)
+        profile.setdefault("lot_size", 0.01)
+        profile["updated_at"] = now_utc().isoformat()
+        users[uid] = profile
+        save_mt5_users(users)
+        await update.message.reply_text(f"✅ Max open MT5 trades saved: {max_trades}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid number. Example: /setmaxtrades 10\nError: {e}")
+
+
 async def mt5link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
     users = get_mt5_users()
@@ -1990,7 +2070,7 @@ async def mt5status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Enabled: `{profile.get('enabled', False)}`\n"
         f"EA Code: `{profile.get('bridge_code', 'None')}`\n"
         f"Lot Size: `{profile.get('lot_size', 0.01)}`\n"
-        f"Active/Pending Orders: `{active_count}/{MAX_ACTIVE_MT5_ORDERS}`",
+        f"Active/Pending Orders: `{active_count}/{mt5_max_trades(update.effective_user.id)}`",
         parse_mode="Markdown",
     )
 
@@ -2231,6 +2311,7 @@ def main():
     app.add_handler(CommandHandler("vipperformance", vip_performance_command))
     app.add_handler(CommandHandler("adminstats", adminstats))
     app.add_handler(CommandHandler("setlot", setlot))
+    app.add_handler(CommandHandler("setmaxtrades", setmaxtrades))
     app.add_handler(CommandHandler("mt5link", mt5link))
     app.add_handler(CommandHandler("mt5status", mt5status))
     app.add_handler(CommandHandler("mt5off", mt5off))

@@ -2,6 +2,8 @@ import requests
 from config import BOT_TOKEN, GROUP_CHAT_ID
 
 def send_group(text: str) -> bool:
+    # Send messages using Telegram Bot HTTP API.
+    # This avoids python-telegram-bot package errors.
     if not BOT_TOKEN:
         print("BOT_TOKEN is missing")
         return False

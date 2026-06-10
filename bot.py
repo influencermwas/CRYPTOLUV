@@ -47,7 +47,8 @@ MT5_ORDERS_FILE = "mt5_orders.json"
 AUTO_VIP_FILE = "auto_vip_last_sent.json"
 MARKET_CACHE_FILE = "market_cache.json"
 CACHE_MINUTES = int(os.getenv("CACHE_MINUTES", "15") or 15)
-A_PLUS_MIN_CONFIDENCE = int(os.getenv("A_PLUS_MIN_CONFIDENCE", "85") or 85)
+A_PLUS_MIN_CONFIDENCE = int(os.getenv("A_PLUS_MIN_CONFIDENCE", "90") or 90)
+A_SIGNAL_MIN_CONFIDENCE = int(os.getenv("A_SIGNAL_MIN_CONFIDENCE", "85") or 85)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")).strip()
@@ -55,8 +56,6 @@ USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
 VIP_HISTORY_TABLE = os.getenv("VIP_HISTORY_TABLE", "signals_vip_history").strip()
 PREMIUM_TABLE = os.getenv("PREMIUM_TABLE", "signals_premium_users").strip()
-VIP_ALERTS_FILE = "vip_tp_alerts.json"
-REFERRALS_FILE = "premium_referrals.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -95,8 +94,7 @@ FREE_CONFIDENCE_LIMIT = int(os.getenv("FREE_CONFIDENCE_LIMIT", "80") or 80)
 PREMIUM_MIN_CONFIDENCE = int(os.getenv("PREMIUM_MIN_CONFIDENCE", "79") or 79)
 PREMIUM_DAILY_LIMIT = int(os.getenv("PREMIUM_DAILY_LIMIT", "5") or 5)
 PREMIUM_CRYPTO_SCAN_LIMIT = int(os.getenv("PREMIUM_CRYPTO_SCAN_LIMIT", "12") or 12)
-PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "12") or 12)
-PREMIUM_METALS_SCAN_LIMIT = int(os.getenv("PREMIUM_METALS_SCAN_LIMIT", "4") or 4)
+PREMIUM_FOREX_SCAN_LIMIT = int(os.getenv("PREMIUM_FOREX_SCAN_LIMIT", "8") or 8)
 PREMIUM_STOCK_SCAN_LIMIT = int(os.getenv("PREMIUM_STOCK_SCAN_LIMIT", "8") or 8)
 VIP_LEVERAGE = float(os.getenv("VIP_LEVERAGE", "10") or 10)
 AUTO_VIP_SIGNALS_ENABLED = os.getenv("AUTO_VIP_SIGNALS_ENABLED", "0").strip() == "1"
@@ -117,15 +115,11 @@ CRYPTO_WATCHLIST = [
 
 FOREX_WATCHLIST = [
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "NZD/USD",
-    "USD/CHF", "GBP/JPY", "EUR/JPY", "EUR/GBP", "EUR/AUD", "AUD/JPY",
-    "CAD/JPY", "CHF/JPY", "GBP/CAD", "GBP/AUD", "EUR/CAD", "NZD/JPY",
-]
-
-METALS_WATCHLIST = [
-    "XAU/USD",  # Gold
-    "XAG/USD",  # Silver
-    "XPT/USD",  # Platinum
-    "XPD/USD",  # Palladium
+    "USD/CHF", "GBP/JPY", "EUR/JPY", "EUR/GBP", "EUR/AUD", "EUR/CAD",
+    "EUR/CHF", "GBP/CAD", "GBP/CHF", "AUD/JPY", "AUD/CAD", "AUD/NZD",
+    "CAD/JPY", "CHF/JPY", "NZD/JPY",
+    # Metals
+    "XAU/USD", "XAG/USD", "XPT/USD", "XPD/USD",
 ]
 
 STOCK_WATCHLIST = [
@@ -231,16 +225,72 @@ def leverage_pnl_percent(direction: str, entry: float, target: float):
     return move_pct * VIP_LEVERAGE
 
 
-def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
-    """
-    Queue a VIP signal for the user's laptop MT5 bridge.
+def premium_grade(confidence: int):
+    confidence = int(confidence or 0)
+    if confidence >= A_PLUS_MIN_CONFIDENCE:
+        return "A+ SIGNAL"
+    if confidence >= A_SIGNAL_MIN_CONFIDENCE:
+        return "A SIGNAL"
+    if confidence >= PREMIUM_MIN_CONFIDENCE:
+        return "B SIGNAL"
+    return "IGNORE"
 
-    IMPORTANT:
-    - BUY signals use BUY_LIMIT at the LOWER entry price.
-    - SELL signals use SELL_LIMIT at the UPPER entry price.
-    - Orders expire after 2 hours if not placed.
-    - This stops BTC/crypto from opening market orders when the user wants exact signal entry.
-    """
+
+def grade_icon(grade: str):
+    if grade.startswith("A+"):
+        return "🏆"
+    if grade.startswith("A ") or grade == "A SIGNAL":
+        return "🔥"
+    if grade.startswith("B"):
+        return "✅"
+    return "⚪"
+
+
+def format_premium_signal_from_meta(meta: dict):
+    symbol = meta.get("symbol", "UNKNOWN")
+    asset_type = str(meta.get("asset_type", "market")).upper()
+    confidence = int(meta.get("confidence", 0) or 0)
+    grade = meta.get("grade") or premium_grade(confidence)
+    direction = meta.get("direction", "WAIT")
+    entry_low = float(meta.get("entry_low", 0) or 0)
+    entry_high = float(meta.get("entry_high", 0) or 0)
+    entry_mid = (entry_low + entry_high) / 2 if entry_low and entry_high else float(meta.get("current_price", 0) or 0)
+    stop = float(meta.get("stop_loss", 0) or 0)
+    tp1 = float(meta.get("tp1", 0) or 0)
+    tp2 = float(meta.get("tp2", 0) or 0)
+    tp3 = float(meta.get("tp3", 0) or 0)
+
+    tp1_pnl = leverage_pnl_percent(direction, entry_mid, tp1) if entry_mid and tp1 else 0
+    tp2_pnl = leverage_pnl_percent(direction, entry_mid, tp2) if entry_mid and tp2 else 0
+    tp3_pnl = leverage_pnl_percent(direction, entry_mid, tp3) if entry_mid and tp3 else 0
+    sl_pnl = leverage_pnl_percent(direction, entry_mid, stop) if entry_mid and stop else 0
+
+    return (
+        f"{grade_icon(grade)} *{grade}*\n"
+        f"💎 *CRYPTO LUV PREMIUM SIGNAL*\n\n"
+        f"Market: *{asset_type}*\n"
+        f"Symbol: `{symbol}`\n"
+        f"Direction: *{direction}*\n"
+        f"Confidence: *{confidence}%*\n"
+        f"Risk: *{meta.get('risk', 'Medium')}*\n"
+        f"Risk Reward: `1:{float(meta.get('risk_reward', 0) or 0):.2f}`\n\n"
+        f"Current Price: `{float(meta.get('current_price', 0) or 0):.6g}`\n"
+        f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
+        f"Stop Loss: `{stop:.6g}`\n"
+        f"Take Profit 1: `{tp1:.6g}` `({tp1_pnl:+.2f}% @ {VIP_LEVERAGE:g}x)`\n"
+        f"Take Profit 2: `{tp2:.6g}` `({tp2_pnl:+.2f}% @ {VIP_LEVERAGE:g}x)`\n"
+        f"Take Profit 3: `{tp3:.6g}` `({tp3_pnl:+.2f}% @ {VIP_LEVERAGE:g}x)`\n"
+        f"SL Risk: `{sl_pnl:+.2f}% @ {VIP_LEVERAGE:g}x`\n\n"
+        f"Daily Trend: `{meta.get('daily_trend', 'Mixed')}`\n"
+        f"ATR: `{float(meta.get('atr_percent', 0) or 0):.3f}%`\n"
+        f"Structure Confirmed: `{meta.get('structure_confirmed', False)}`\n"
+        f"Session OK: `{meta.get('session_ok', True)}`\n\n"
+        "⚠️ Analysis only. Use proper risk management and stop loss."
+    )
+
+
+def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
+    """Queue a VIP signal for the user's laptop MT5 bridge. The laptop bridge pulls these orders."""
     if not is_mt5_linked(user_id):
         return {"queued": False, "reason": "MT5 not linked"}
 
@@ -253,20 +303,7 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
     if direction == "WAIT" or not ("BUY" in direction or "SELL" in direction):
         return {"queued": False, "reason": "Signal is WAIT/neutral"}
 
-    entry_low = float(meta.get("entry_low"))
-    entry_high = float(meta.get("entry_high"))
-
-    if "BUY" in direction:
-        order_type = "BUY_LIMIT"
-        entry = entry_low
-    elif "SELL" in direction:
-        order_type = "SELL_LIMIT"
-        entry = entry_high
-    else:
-        return {"queued": False, "reason": "Invalid direction"}
-
-    created_at = now_utc()
-    expires_at = created_at + timedelta(hours=2)
+    entry = (float(meta.get("entry_low")) + float(meta.get("entry_high"))) / 2
 
     order = {
         "order_id": make_order_id(user_id, meta.get("symbol")),
@@ -275,11 +312,11 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         "asset_type": asset_type,
         "symbol": meta.get("symbol"),
         "direction": direction,
-        "order_type": order_type,
+        "order_type": "MARKET_BUY" if "BUY" in direction else "MARKET_SELL" if "SELL" in direction else "NONE",
         "lot_size": mt5_lot_size(user_id),
         "entry_price": entry,
-        "entry_low": entry_low,
-        "entry_high": entry_high,
+        "entry_low": meta.get("entry_low"),
+        "entry_high": meta.get("entry_high"),
         "stop_loss": meta.get("stop_loss"),
         "tp1": meta.get("tp1"),
         "tp2": meta.get("tp2"),
@@ -291,9 +328,8 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         "sl_pnl_percent": round(leverage_pnl_percent(direction, entry, float(meta.get("stop_loss"))), 2),
         "confidence": meta.get("confidence"),
         "status": "PENDING_TO_BRIDGE",
-        "created_at": created_at.isoformat(),
-        "expires_at": expires_at.isoformat(),
-        "updated_at": created_at.isoformat(),
+        "created_at": now_utc().isoformat(),
+        "updated_at": now_utc().isoformat(),
     }
     orders = get_mt5_orders()
     orders.append(order)
@@ -431,134 +467,6 @@ def activate_premium(user_id: int, hours=24, source="paid", mark_trial_used=Fals
     return expires_dt
 
 
-
-
-def extend_premium(user_id: int, hours=24, source="referral_reward"):
-    """Add premium time without removing any active remaining time."""
-    active, current_expires = is_premium(user_id)
-    base = current_expires if active and current_expires and current_expires > now_utc() else now_utc()
-    expires_dt = base + timedelta(hours=hours)
-
-    if USE_SUPABASE:
-        payload = {
-            "user_id": str(user_id),
-            "expires_at": expires_dt.isoformat(),
-            "source": source,
-            "remind_6h_sent": False,
-            "remind_1h_sent": False,
-            "expired_notice_sent": False,
-            "updated_at": now_utc().isoformat(),
-        }
-        sb_upsert(PREMIUM_TABLE, payload)
-
-    premium = load_json(PREMIUM_FILE, {})
-    premium[str(user_id)] = expires_dt.isoformat()
-    save_json(PREMIUM_FILE, premium)
-    return expires_dt
-
-
-def load_referrals():
-    return load_json(REFERRALS_FILE, {})
-
-
-def save_referrals(data):
-    save_json(REFERRALS_FILE, data)
-
-
-def register_referral(referred_user_id: int, referrer_id: int):
-    """Store who invited a user. Reward happens only after paid premium activation."""
-    if not referrer_id or referrer_id == referred_user_id:
-        return False
-
-    referrals = load_referrals()
-    key = str(referred_user_id)
-    if key in referrals:
-        return False
-
-    referrals[key] = {
-        "referred_user_id": str(referred_user_id),
-        "referrer_id": str(referrer_id),
-        "created_at": now_utc().isoformat(),
-        "rewarded": False,
-        "rewarded_at": None,
-    }
-    save_referrals(referrals)
-    return True
-
-
-async def get_referral_link(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    me = await context.bot.get_me()
-    return f"https://t.me/{me.username}?start=ref_{user_id}"
-
-
-async def send_referral_program(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    referrals = load_referrals()
-    invited = [r for r in referrals.values() if str(r.get("referrer_id")) == str(user_id)]
-    rewarded = [r for r in invited if r.get("rewarded")]
-    pending = [r for r in invited if not r.get("rewarded")]
-    link = await get_referral_link(context, user_id)
-    active, expires = is_premium(user_id)
-    expiry_text = expires.strftime("%Y-%m-%d %H:%M UTC") if active and expires else "Not active"
-
-    recent_lines = []
-    for r in sorted(invited, key=lambda x: x.get("created_at", ""), reverse=True)[:5]:
-        status = "✅ Activated" if r.get("rewarded") else "⏳ Pending"
-        referred = r.get("referred_user_id", "Unknown")
-        recent_lines.append(f"{status} - `{referred}`")
-    recent_text = "\n".join(recent_lines) if recent_lines else "No referrals yet."
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "🤝 *Referral Dashboard*\n\n"
-            "Share your link. When your referred user activates *paid Premium*, "
-            "you receive *1 extra Premium day* automatically.\n\n"
-            f"👥 Total Referrals: *{len(invited)}*\n"
-            f"✅ Activated Premium: *{len(rewarded)}*\n"
-            f"⏳ Pending: *{len(pending)}*\n"
-            f"🎁 Premium Days Earned: *{len(rewarded)}*\n"
-            f"💎 Your Premium Expiry: `{expiry_text}`\n\n"
-            f"🔗 *Your Referral Link:*\n`{link}`\n\n"
-            f"📋 *Recent Referrals:*\n{recent_text}\n\n"
-            "✅ Reward is given once per referred user after successful M-Pesa payment."
-        ),
-        parse_mode="Markdown",
-    )
-
-
-async def reward_referrer_for_paid_premium(referred_user_id: int, bot):
-    referrals = load_referrals()
-    key = str(referred_user_id)
-    referral = referrals.get(key)
-    if not referral or referral.get("rewarded"):
-        return None
-
-    referrer_id = int(referral.get("referrer_id") or 0)
-    if not referrer_id or referrer_id == referred_user_id:
-        return None
-
-    expires = extend_premium(referrer_id, 24, source=f"referral_reward:{referred_user_id}")
-    referral["rewarded"] = True
-    referral["rewarded_at"] = now_utc().isoformat()
-    referrals[key] = referral
-    save_referrals(referrals)
-
-    try:
-        await bot.send_message(
-            chat_id=referrer_id,
-            text=(
-                "🎁 *Referral Reward Added!*\n\n"
-                "Your referred user activated Premium.\n"
-                "You received *1 free day of Premium*.\n\n"
-                f"New expiry: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`"
-            ),
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        logger.warning("Could not notify referral referrer %s: %s", referrer_id, e)
-
-    return referrer_id
-
 def ensure_free_trial(user_id: int):
     """Give 24h free trial once per user. Returns expiry if trial was created."""
     if USE_SUPABASE:
@@ -634,7 +542,6 @@ def main_menu():
             InlineKeyboardButton("⚡ DOGE", callback_data="quick_DOGEUSDT"),
         ],
         [InlineKeyboardButton("💎 Premium Signals", callback_data="premium")],
-        [InlineKeyboardButton("🤝 Referral Dashboard", callback_data="referral")],
         [
             InlineKeyboardButton("📜 VIP History", callback_data="vip_history"),
             InlineKeyboardButton("📊 VIP Performance", callback_data="vip_performance"),
@@ -647,15 +554,6 @@ def main_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id)
-
-    # Deep link example: https://t.me/YOUR_BOT?start=ref_123456789
-    if context.args:
-        raw_ref = str(context.args[0]).strip()
-        if raw_ref.startswith("ref_"):
-            try:
-                register_referral(update.effective_user.id, int(raw_ref.replace("ref_", "", 1)))
-            except Exception as e:
-                logger.warning("Invalid referral code %s: %s", raw_ref, e)
 
     if not await has_required_access(update.effective_user.id, context):
         await send_access_gate(update.effective_chat.id, context)
@@ -708,8 +606,6 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_analysis(query.message.chat_id, query.from_user.id, context, symbol, "crypto", premium=False)
     elif data == "premium":
         await show_premium(query.message.chat_id, query.from_user.id, context)
-    elif data == "referral":
-        await send_referral_program(query.message.chat_id, query.from_user.id, context)
     elif data == "vip_signal":
         await premium_signals(query.message.chat_id, query.from_user.id, context)
     elif data == "pay_premium":
@@ -759,8 +655,7 @@ async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             text=(
                 "✅ *Premium Active*\n\n"
                 f"Expires: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
-                "Tap below to receive today's VIP signals.\n\n"
-                "🤝 Share your referral link to earn 1 free Premium day when your friend pays."
+                "Tap below to receive today's VIP signals."
             ),
             parse_mode="Markdown",
             reply_markup=keyboard,
@@ -780,8 +675,7 @@ async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             "🔥 Stop loss\n"
             "🔥 CHoCH, BOS, FVG\n"
             "🔥 Order block and liquidity sweep\n\n"
-            "Tap below to pay automatically using STK Push.\n\n"
-            "🤝 After subscribing, share your referral link and earn 1 free Premium day per paid referral."
+            "Tap below to pay automatically using STK Push."
         ),
         parse_mode="Markdown",
         reply_markup=keyboard,
@@ -903,7 +797,6 @@ async def handle_mpesa_callback(data: dict, bot):
 
     if result_code == 0:
         expires = activate_premium(user_id, 24)
-        await reward_referrer_for_paid_premium(user_id, bot)
         pending.pop(checkout_id, None)
         save_json(PENDING_FILE, pending)
 
@@ -1013,6 +906,8 @@ def finnhub_symbol(symbol: str, asset_type: str):
         "EURJPY": "OANDA:EUR_JPY",
         "XAUUSD": "OANDA:XAU_USD",
         "XAGUSD": "OANDA:XAG_USD",
+        "XPTUSD": "OANDA:XPT_USD",
+        "XPDUSD": "OANDA:XPD_USD",
     }
 
     if asset_type == "forex":
@@ -1185,22 +1080,6 @@ def risk_reward_ratio(direction: str, entry: float, stop: float, target: float):
         return 0
 
 
-def signal_grade(confidence: int):
-    """Premium grading requested by owner."""
-    confidence = int(confidence or 0)
-    if confidence >= 90:
-        return "A+ SIGNAL"
-    if confidence >= 85:
-        return "A SIGNAL"
-    if confidence >= 79:
-        return "B SIGNAL"
-    return "NO VIP SIGNAL"
-
-
-def grade_rank(grade: str):
-    return {"A+ SIGNAL": 3, "A SIGNAL": 2, "B SIGNAL": 1}.get(grade, 0)
-
-
 def is_active_trading_session(asset_type: str):
     """Avoid low-liquidity hours for forex/stocks. Crypto remains allowed."""
     hour = now_utc().hour
@@ -1246,17 +1125,15 @@ def add_quality_fields(meta: dict, df: pd.DataFrame, asset_type: str, daily_tren
     meta["structure_confirmed"] = structure_is_strong(df)
 
     atr_min = 0.04 if asset_type == "forex" else 0.12 if asset_type == "crypto" else 0.08
-    aplus_quality = (
-        meta.get("confidence", 0) >= A_PLUS_MIN_CONFIDENCE
-        and meta.get("direction") != "WAIT"
-        and direction_matches_trend(meta.get("direction", ""), daily_trend)
-        and atr_percent >= atr_min
-        and rr >= 3
+    # Grade is based on confidence exactly as requested:
+    # 79-84 = B, 85-89 = A, 90+ = A+.
+    meta["grade"] = premium_grade(meta.get("confidence", 0))
+    meta["passes_quality_filter"] = (
+        meta.get("direction") != "WAIT"
+        and meta.get("grade") != "IGNORE"
+        and rr >= 1.5
         and meta["session_ok"]
-        and meta["structure_confirmed"]
     )
-    meta["grade"] = signal_grade(meta.get("confidence", 0))
-    meta["setup_quality"] = "A+ QUALITY" if aplus_quality else "STANDARD QUALITY"
     return meta
 
 
@@ -1479,7 +1356,6 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         return {
             "symbol": symbol.upper(),
             "confidence": confidence,
-            "grade": signal_grade(confidence),
             "rating": rating,
             "direction": direction,
             "risk": risk,
@@ -1558,8 +1434,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         f"Support: `{support:.6g}`\n"
         f"Resistance: `{resistance:.6g}`\n"
         f"Risk: *{risk}*\n"
-        f"Confidence: *{confidence}%*\n"
-        f"Signal Grade: *{signal_grade(confidence)}*\n\n"
+        f"Confidence: *{confidence}%*\n\n"
         f"📌 *SMC Analysis*\n"
         f"CHoCH/BOS: `{structure_text}`\n"
         f"FVG: `{fvg}`\n"
@@ -1644,22 +1519,7 @@ def fetch_for_asset(symbol: str, asset_type: str):
     return fetch_yahoo_klines(symbol, asset_type, "15m", 150)
 
 
-def signal_local_key(row: dict):
-    return str(row.get("id") or f"{row.get('user_id')}:{row.get('symbol')}:{row.get('created_at')}")
-
-
-def hit_profit_percent(direction: str, entry_mid: float, price: float):
-    if not entry_mid:
-        return 0.0
-    if "SELL" in direction:
-        move = ((entry_mid - price) / entry_mid) * 100
-    else:
-        move = ((price - entry_mid) / entry_mid) * 100
-    return round(move * VIP_LEVERAGE, 2)
-
-
-def evaluate_signal_progress(row: dict):
-    """Return all TP/SL levels touched since signal creation. TP1/TP2 stay RUNNING; TP3 or SL closes."""
+def evaluate_signal_outcome(row: dict):
     try:
         df = fetch_for_asset(row["symbol"], row.get("asset_type", "crypto"))
         created = parse_dt(row.get("created_at")) or (now_utc() - timedelta(days=3))
@@ -1676,129 +1536,46 @@ def evaluate_signal_progress(row: dict):
         tp3 = float(row.get("tp3"))
         entry_mid = (float(row.get("entry_low")) + float(row.get("entry_high"))) / 2
 
-        hits = []
-        final_status = "RUNNING"
-        final_profit = 0.0
-
         for _, c in df.iterrows():
             high = float(c["high"])
             low = float(c["low"])
-
             if "BUY" in direction:
-                # Conservative rule: if SL and TP happen in the same candle, SL is counted first.
                 if low <= stop:
-                    hits.append(("SL", stop, hit_profit_percent(direction, entry_mid, stop)))
-                    final_status = "LOSS"
-                    final_profit = round(((stop - entry_mid) / entry_mid) * 100, 2)
-                    break
-                if high >= tp1 and not any(h[0] == "TP1" for h in hits):
-                    hits.append(("TP1", tp1, hit_profit_percent(direction, entry_mid, tp1)))
-                if high >= tp2 and not any(h[0] == "TP2" for h in hits):
-                    hits.append(("TP2", tp2, hit_profit_percent(direction, entry_mid, tp2)))
-                if high >= tp3 and not any(h[0] == "TP3" for h in hits):
-                    hits.append(("TP3", tp3, hit_profit_percent(direction, entry_mid, tp3)))
-                    final_status = "WIN"
-                    final_profit = round(((tp3 - entry_mid) / entry_mid) * 100, 2)
-                    break
-
+                    return "LOSS", round(((stop - entry_mid) / entry_mid) * 100, 2)
+                if high >= tp3:
+                    return "WIN", round(((tp3 - entry_mid) / entry_mid) * 100, 2)
+                if high >= tp2:
+                    return "WIN", round(((tp2 - entry_mid) / entry_mid) * 100, 2)
+                if high >= tp1:
+                    return "WIN", round(((tp1 - entry_mid) / entry_mid) * 100, 2)
             elif "SELL" in direction:
                 if high >= stop:
-                    hits.append(("SL", stop, hit_profit_percent(direction, entry_mid, stop)))
-                    final_status = "LOSS"
-                    final_profit = round(((entry_mid - stop) / entry_mid) * 100, 2)
-                    break
-                if low <= tp1 and not any(h[0] == "TP1" for h in hits):
-                    hits.append(("TP1", tp1, hit_profit_percent(direction, entry_mid, tp1)))
-                if low <= tp2 and not any(h[0] == "TP2" for h in hits):
-                    hits.append(("TP2", tp2, hit_profit_percent(direction, entry_mid, tp2)))
-                if low <= tp3 and not any(h[0] == "TP3" for h in hits):
-                    hits.append(("TP3", tp3, hit_profit_percent(direction, entry_mid, tp3)))
-                    final_status = "WIN"
-                    final_profit = round(((entry_mid - tp3) / entry_mid) * 100, 2)
-                    break
-
-        return {"hits": hits, "status": final_status, "profit_percent": final_profit}
+                    return "LOSS", round(((entry_mid - stop) / entry_mid) * 100, 2)
+                if low <= tp3:
+                    return "WIN", round(((entry_mid - tp3) / entry_mid) * 100, 2)
+                if low <= tp2:
+                    return "WIN", round(((entry_mid - tp2) / entry_mid) * 100, 2)
+                if low <= tp1:
+                    return "WIN", round(((entry_mid - tp1) / entry_mid) * 100, 2)
     except Exception as e:
-        logger.warning("Signal progress check failed: %s", e)
+        logger.warning("Signal outcome check failed: %s", e)
     return None
-
-
-def evaluate_signal_outcome(row: dict):
-    progress = evaluate_signal_progress(row)
-    if not progress or progress.get("status") == "RUNNING":
-        return None
-    return progress.get("status"), progress.get("profit_percent", 0)
-
-
-def format_hit_alert(row: dict, level: str, price: float, leverage_profit: float):
-    symbol = row.get("symbol", "")
-    direction = row.get("direction", "")
-    entry_mid = (float(row.get("entry_low")) + float(row.get("entry_high"))) / 2
-    grade = row.get("grade") or signal_grade(int(row.get("confidence") or 0))
-
-    if level == "TP1":
-        title = "🎯 TP1 HIT"
-        note = "Protect the trade. Consider moving SL to breakeven."
-    elif level == "TP2":
-        title = "🚀 TP2 HIT"
-        note = "Strong move. Consider locking partial profit."
-    elif level == "TP3":
-        title = "🏆 TP3 HIT — FULL TARGET"
-        note = "Signal closed in profit."
-    else:
-        title = "❌ STOP LOSS HIT"
-        note = "Signal closed. Wait for the next clean setup."
-
-    return (
-        f"{title}\n"
-        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
-        f"Symbol: `{symbol}`\n"
-        f"Grade: *{grade}*\n"
-        f"Direction: *{direction}*\n"
-        f"Entry: `{entry_mid:.6g}`\n"
-        f"Hit Price: `{price:.6g}`\n"
-        f"Result @ {VIP_LEVERAGE:g}x: `{leverage_profit:+.2f}%`\n\n"
-        f"{note}"
-    )
 
 
 async def update_vip_results(context: ContextTypes.DEFAULT_TYPE = None):
     if not USE_SUPABASE:
         return
     rows = sb_get(VIP_HISTORY_TABLE, {"status": "eq.RUNNING", "select": "*", "limit": "100"}) or []
-    alerted = load_json(VIP_ALERTS_FILE, {})
-
     for row in rows:
-        progress = evaluate_signal_progress(row)
-        if not progress:
+        result = evaluate_signal_outcome(row)
+        if not result:
             continue
-
-        row_key = signal_local_key(row)
-        already = set(alerted.get(row_key, []))
-
-        for level, price, leverage_profit in progress.get("hits", []):
-            if level in already:
-                continue
-            if context is not None:
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(row.get("user_id")),
-                        text=format_hit_alert(row, level, price, leverage_profit),
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logger.warning("Failed to send %s alert for %s: %s", level, row_key, e)
-            already.add(level)
-
-        alerted[row_key] = sorted(already)
-        save_json(VIP_ALERTS_FILE, alerted)
-
-        if progress.get("status") in ["WIN", "LOSS"]:
-            sb_patch(VIP_HISTORY_TABLE, {"id": f"eq.{row['id']}"}, {
-                "status": progress.get("status"),
-                "profit_percent": progress.get("profit_percent", 0),
-                "updated_at": now_utc().isoformat(),
-            })
+        status, profit_percent = result
+        sb_patch(VIP_HISTORY_TABLE, {"id": f"eq.{row['id']}"}, {
+            "status": status,
+            "profit_percent": profit_percent,
+            "updated_at": now_utc().isoformat(),
+        })
 
 
 async def send_vip_history(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -1869,11 +1646,6 @@ async def vip_performance_command(update: Update, context: ContextTypes.DEFAULT_
     register_user(update.effective_user.id)
     admin_all = update.effective_user.id == ADMIN_ID and context.args and context.args[0].lower() == "all"
     await send_vip_performance(update.effective_chat.id, update.effective_user.id, context, admin_all=admin_all)
-
-
-async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user.id)
-    await send_referral_program(update.effective_chat.id, update.effective_user.id, context)
 
 
 async def givepremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1985,44 +1757,38 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "🔎 *Scanning markets for best VIP signals...*\n\n"
-            "Checking:\n"
-            "• Crypto pairs\n"
-            "• Forex pairs\n"
-            "• Metals: Gold XAU/USD, Silver XAG/USD, Platinum XPT/USD, Palladium XPD/USD\n"
-            "• Stocks\n\n"
-            "Only *79%+ confidence* setups will be sent:\n"
-            "*79-84% = B SIGNAL*\n"
-            "*85-89% = A SIGNAL*\n"
-            "*90%+ = A+ SIGNAL*"
+            "🔎 *Scanning Premium Markets...*\n\n"
+            "Checking crypto, forex, metals and stocks to find the best B / A / A+ setups.\n"
+            "Minimum confidence: *79%*."
         ),
         parse_mode="Markdown",
     )
 
     candidates = []
+    errors = []
 
-    async def scan_list(symbols, asset_type, label):
-        found = []
-        for symbol in symbols:
+    scan_groups = [
+        ("crypto", CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT]),
+        ("forex", FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT]),
+        ("stock", STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT]),
+    ]
+
+    for asset_type, watchlist in scan_groups:
+        for symbol in watchlist:
             try:
                 meta = await score_symbol(symbol, asset_type)
-                if meta.get("direction") != "WAIT" and int(meta.get("confidence", 0)) >= PREMIUM_MIN_CONFIDENCE:
-                    meta["asset_type"] = asset_type
-                    meta["market_group"] = label
-                    meta["grade"] = signal_grade(meta.get("confidence", 0))
-                    found.append(meta)
-            except Exception as e:
-                logger.warning("%s scan failed for %s: %s", label, symbol, e)
-        return found
+                meta["asset_type"] = asset_type
+                meta["grade"] = premium_grade(meta.get("confidence", 0))
 
-    candidates.extend(await scan_list(CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT], "crypto", "Crypto"))
-    candidates.extend(await scan_list(METALS_WATCHLIST[:PREMIUM_METALS_SCAN_LIMIT], "forex", "Metals"))
-    candidates.extend(await scan_list(FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT], "forex", "Forex"))
-    candidates.extend(await scan_list(STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT], "stock", "Stocks"))
+                if meta.get("direction") != "WAIT" and meta.get("grade") != "IGNORE":
+                    candidates.append(meta)
+            except Exception as e:
+                logger.warning("Premium scan failed for %s %s: %s", asset_type, symbol, e)
+                errors.append(f"{symbol}: {e}")
 
     candidates = sorted(
         candidates,
-        key=lambda x: (grade_rank(x.get("grade")), x.get("confidence", 0), x.get("risk_reward", 0)),
+        key=lambda x: (int(x.get("confidence", 0) or 0), float(x.get("risk_reward", 0) or 0)),
         reverse=True,
     )[:PREMIUM_DAILY_LIMIT]
 
@@ -2030,26 +1796,58 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⚠️ No 79%+ VIP setup found right now.\n\n"
-                "The bot scanned crypto, forex, metals and stocks but did not find a strong enough entry. "
-                "Try again later or wait for market confirmation."
+                "⚪ No 79%+ premium setup found right now.\n\n"
+                "The bot scanned crypto, forex, metals and stocks, but no valid B / A / A+ signal passed."
             ),
         )
         return
 
-    summary_lines = ["💎 *Best VIP setups found:*\n"]
-    for item in candidates:
-        summary_lines.append(
-            f"{item.get('grade')} — `{item['symbol']}` {item.get('direction')} "
-            f"| Confidence: *{item.get('confidence')}%* | {item.get('market_group')}"
-        )
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(summary_lines), parse_mode="Markdown")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"💎 Found *{len(candidates)}* premium setup(s). Sending all now...",
+        parse_mode="Markdown",
+    )
 
+    sent = 0
+    failed = 0
     for item in candidates:
         try:
-            await send_analysis(chat_id, user_id, context, item["symbol"], item["asset_type"], premium=True)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=format_premium_signal_from_meta(item),
+                parse_mode="Markdown",
+            )
+            sent += 1
+            save_vip_signal(user_id, item.get("asset_type", "crypto"), item)
+
+            mt5_result = queue_mt5_pending_order(user_id, item.get("asset_type", "crypto"), item)
+            if mt5_result.get("queued"):
+                order = mt5_result["order"]
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "🤖 *MT5 EA Order Queued*\n\n"
+                        f"Symbol: `{order['symbol']}`\n"
+                        f"Type: `{order['order_type']}`\n"
+                        f"Lot Size: `{order['lot_size']}`\n"
+                        f"Entry: `{order['entry_price']:.6g}`\n"
+                        f"SL: `{float(order['stop_loss']):.6g}`\n"
+                        f"TP1: `{float(order['tp1']):.6g}`"
+                    ),
+                    parse_mode="Markdown",
+                )
         except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to send {item['symbol']}: {e}")
+            failed += 1
+            logger.exception("Failed to send premium signal %s", item.get("symbol"))
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to send {item.get('symbol')}: {e}")
+            except Exception:
+                pass
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ Premium scan finished. Sent: {sent}. Failed: {failed}.",
+    )
 
 
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2099,11 +1897,10 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
                     f"Symbol: `{order['symbol']}`\n"
                     f"Type: `{order['order_type']}`\n"
                     f"Lot Size: `{order['lot_size']}`\n"
-                    f"Exact Entry: `{order['entry_price']:.6g}`\n"
+                    f"Entry: `{order['entry_price']:.6g}`\n"
                     f"SL: `{float(order['stop_loss']):.6g}`\n"
-                    f"TP1: `{float(order['tp1']):.6g}`\n"
-                    f"Expires: `{parse_dt(order['expires_at']).strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
-                    "Keep MT5 open. The EA should place this as a pending limit order, not market."
+                    f"TP1: `{float(order['tp1']):.6g}`\n\n"
+                    "Keep MT5 open and the InfluencerTech EA attached to any chart."
                 ),
                 parse_mode="Markdown",
             )
@@ -2161,7 +1958,8 @@ async def mt5link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = get_mt5_users()
     uid = str(update.effective_user.id)
     profile = users.get(uid, {})
-    code = profile.get("bridge_code") or f"BRIDGE-{uid[-6:]}-{now_utc().strftime('%H%M%S')}"
+    # Stable per-user code. No timestamp, so it will not keep changing after restart/redeploy.
+    code = profile.get("bridge_code") or f"BRIDGE-{uid}"
     profile["bridge_code"] = code
     profile["enabled"] = True
     profile.setdefault("lot_size", 0.01)
@@ -2227,7 +2025,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean = text.upper().replace("/", "").replace("-", "").replace("_", "").replace(" ", "")
 
     crypto_shortcuts = [s.replace("USDT", "") for s in CRYPTO_WATCHLIST]
-    forex_symbols = [s.replace("/", "") for s in (FOREX_WATCHLIST + METALS_WATCHLIST)]
+    forex_symbols = [s.replace("/", "") for s in FOREX_WATCHLIST]
     stock_symbols = STOCK_WATCHLIST
 
     if clean in crypto_shortcuts:
@@ -2336,21 +2134,7 @@ async def _send_broadcast_message(bot, user_id: int, text: str):
         await bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
         return True
     except Exception as e:
-        logger.warning("Broadcast text failed for %s: %s", user_id, e)
-        return False
-
-
-async def _copy_broadcast_message(bot, user_id: int, source_chat_id: int, message_id: int):
-    """Copy any Telegram message: photo, video, document, audio, voice, sticker or text."""
-    try:
-        await bot.copy_message(
-            chat_id=user_id,
-            from_chat_id=source_chat_id,
-            message_id=message_id,
-        )
-        return True
-    except Exception as e:
-        logger.warning("Broadcast media/copy failed for %s: %s", user_id, e)
+        logger.warning("Broadcast failed for %s: %s", user_id, e)
         return False
 
 
@@ -2359,40 +2143,24 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Admin only.")
         return
 
+    message = " ".join(context.args).strip()
+    if not message:
+        await update.message.reply_text("Use: /broadcast your message")
+        return
+
     users = load_json(USERS_FILE, [])
     users = list(dict.fromkeys(users))
     if not users:
         await update.message.reply_text("No users found in users.json yet.")
         return
 
-    reply = update.message.reply_to_message
-    message = " ".join(context.args).strip()
+    text = (
+        "📢 *Broadcast*\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+        f"{message}"
+    )
 
-    if reply:
-        mode = "copy"
-        source_chat_id = reply.chat_id
-        source_message_id = reply.message_id
-        await update.message.reply_text(
-            f"📢 Forwarding/copying replied message to {len(users)} users...\n"
-            "Supported: text, photos, videos, files, audio, stickers and captions."
-        )
-    elif message:
-        mode = "text"
-        text = (
-            "📢 *Broadcast*\n"
-            "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
-            f"{message}"
-        )
-        await update.message.reply_text(f"📢 Sending text broadcast to {len(users)} users...")
-    else:
-        await update.message.reply_text(
-            "Use one of these:\n\n"
-            "1️⃣ `/broadcast your message` for text.\n"
-            "2️⃣ Reply `/broadcast` to any photo, video, document, voice note, sticker, or text message to broadcast it."
-            ,
-            parse_mode="Markdown",
-        )
-        return
+    await update.message.reply_text(f"📢 Sending broadcast to {len(users)} users...")
 
     sent = 0
     failed = 0
@@ -2400,12 +2168,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
-        if mode == "copy":
-            tasks = [_copy_broadcast_message(context.bot, user_id, source_chat_id, source_message_id) for user_id in batch]
-        else:
-            tasks = [_send_broadcast_message(context.bot, user_id, text) for user_id in batch]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(
+            *[_send_broadcast_message(context.bot, user_id, text) for user_id in batch],
+            return_exceptions=True,
+        )
         sent += sum(1 for result in results if result is True)
         failed += sum(1 for result in results if result is not True)
         await asyncio.sleep(0.5)
@@ -2436,7 +2202,6 @@ async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💎 Premium Users: *{len(premium)}*\n"
         f"📈 Crypto Scan Limit: *{PREMIUM_CRYPTO_SCAN_LIMIT}*\n"
         f"💱 Forex Scan Limit: *{PREMIUM_FOREX_SCAN_LIMIT}*\n"
-        f"🥇 Metals Scan Limit: *{PREMIUM_METALS_SCAN_LIMIT}*\n"
         f"🏛 Stock Scan Limit: *{PREMIUM_STOCK_SCAN_LIMIT}*\n"
         f"🎯 Daily VIP Limit: *{PREMIUM_DAILY_LIMIT}*\n"
         f"📊 VIP Min Confidence: *{PREMIUM_MIN_CONFIDENCE}%*\n"
@@ -2461,8 +2226,6 @@ def main():
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("premium", premium_command))
-    app.add_handler(CommandHandler("referral", referral_command))
-    app.add_handler(CommandHandler("referrals", referral_command))
     app.add_handler(CommandHandler("givepremium", givepremium))
     app.add_handler(CommandHandler("viphistory", vip_history_command))
     app.add_handler(CommandHandler("vipperformance", vip_performance_command))

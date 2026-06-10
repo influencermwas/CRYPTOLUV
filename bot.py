@@ -1284,6 +1284,110 @@ def risk_reward_ratio(direction: str, entry: float, stop: float, target: float):
         return 0
 
 
+def _safe_float(value, fallback=0.0):
+    try:
+        value = float(value)
+        if math.isnan(value) or math.isinf(value):
+            return fallback
+        return value
+    except Exception:
+        return fallback
+
+
+def _clamp(value: float, low: float, high: float):
+    return max(low, min(high, value))
+
+
+def _recent_structure_levels(df: pd.DataFrame, close: float, lookback=80):
+    """Return practical nearby support/resistance levels from recent candles.
+    This avoids TP/SL being placed too far away from current market price.
+    """
+    recent = df.tail(lookback).copy()
+    supports = []
+    resistances = []
+
+    for i in range(2, len(recent) - 2):
+        low = _safe_float(recent["low"].iloc[i])
+        high = _safe_float(recent["high"].iloc[i])
+        if low <= recent["low"].iloc[i-2:i+3].min():
+            supports.append(low)
+        if high >= recent["high"].iloc[i-2:i+3].max():
+            resistances.append(high)
+
+    # Always include recent range levels as fallback.
+    supports.extend([_safe_float(recent["low"].tail(20).min()), _safe_float(recent["low"].tail(50).min())])
+    resistances.extend([_safe_float(recent["high"].tail(20).max()), _safe_float(recent["high"].tail(50).max())])
+
+    supports = sorted({x for x in supports if x and x < close}, reverse=True)
+    resistances = sorted({x for x in resistances if x and x > close})
+    return supports, resistances
+
+
+def smart_tp_sl_levels(df: pd.DataFrame, direction: str, close: float):
+    """Smart TP/SL engine for INFLUENCERTECH SIGNALS.
+
+    Logic:
+    - SL uses nearby swing/support/resistance plus small ATR buffer.
+    - TP1 uses nearest realistic liquidity/support/resistance target.
+    - TP2/TP3 extend gradually, but are capped by ATR so they are not too far.
+    - Minimum distance is also protected so SL/TP are not too tight.
+    """
+    df_atr = add_atr(df)
+    atr = _safe_float(df_atr["atr"].iloc[-1], close * 0.006)
+    if atr <= 0:
+        atr = close * 0.006
+
+    supports, resistances = _recent_structure_levels(df, close)
+
+    # Balanced scalping/swing distances. These keep levels realistic.
+    min_sl = 0.75 * atr
+    max_sl = 1.80 * atr
+    min_tp1 = 0.80 * atr
+    max_tp1 = 2.00 * atr
+    max_tp2 = 3.20 * atr
+    max_tp3 = 4.80 * atr
+    buffer = 0.25 * atr
+
+    if "SELL" in direction:
+        nearest_resistance = resistances[0] if resistances else close + atr
+        raw_stop = nearest_resistance + buffer
+        stop_distance = _clamp(raw_stop - close, min_sl, max_sl)
+        stop = close + stop_distance
+
+        target_candidates = [x for x in supports if close - max_tp3 <= x <= close - min_tp1]
+        tp1 = target_candidates[0] if target_candidates else close - (1.15 * atr)
+        tp1_distance = _clamp(close - tp1, min_tp1, max_tp1)
+        tp1 = close - tp1_distance
+
+        tp2_raw = target_candidates[1] if len(target_candidates) > 1 else close - (2.20 * atr)
+        tp2_distance = _clamp(close - tp2_raw, tp1_distance + 0.60 * atr, max_tp2)
+        tp2 = close - tp2_distance
+
+        tp3_raw = target_candidates[2] if len(target_candidates) > 2 else close - (3.40 * atr)
+        tp3_distance = _clamp(close - tp3_raw, tp2_distance + 0.70 * atr, max_tp3)
+        tp3 = close - tp3_distance
+    else:
+        nearest_support = supports[0] if supports else close - atr
+        raw_stop = nearest_support - buffer
+        stop_distance = _clamp(close - raw_stop, min_sl, max_sl)
+        stop = close - stop_distance
+
+        target_candidates = [x for x in resistances if close + min_tp1 <= x <= close + max_tp3]
+        tp1 = target_candidates[0] if target_candidates else close + (1.15 * atr)
+        tp1_distance = _clamp(tp1 - close, min_tp1, max_tp1)
+        tp1 = close + tp1_distance
+
+        tp2_raw = target_candidates[1] if len(target_candidates) > 1 else close + (2.20 * atr)
+        tp2_distance = _clamp(tp2_raw - close, tp1_distance + 0.60 * atr, max_tp2)
+        tp2 = close + tp2_distance
+
+        tp3_raw = target_candidates[2] if len(target_candidates) > 2 else close + (3.40 * atr)
+        tp3_distance = _clamp(tp3_raw - close, tp2_distance + 0.70 * atr, max_tp3)
+        tp3 = close + tp3_distance
+
+    return stop, tp1, tp2, tp3
+
+
 def is_active_trading_session(asset_type: str):
     """Avoid low-liquidity hours for forex/stocks. Crypto remains allowed."""
     hour = now_utc().hour
@@ -1525,19 +1629,15 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         rating = "🟢 STRONG BUY" if bullish - bearish >= 4 else "🟡 BUY"
         entry_low = close * 0.998
         entry_high = close * 1.002
-        stop = min(support, close * 0.985)
-        tp1 = close * 1.015
-        tp2 = close * 1.030
-        tp3 = close * 1.050
+        stop, tp1, tp2, tp3 = smart_tp_sl_levels(df, direction, close)
+        reasons.append("Smart TP/SL: SL below nearby support/swing with ATR buffer; TP targets nearby resistance/liquidity zones.")
     elif bearish > bullish:
         direction = "SELL / SHORT"
         rating = "🔴 STRONG SELL" if bearish - bullish >= 4 else "🟠 SELL"
         entry_low = close * 0.998
         entry_high = close * 1.002
-        stop = max(resistance, close * 1.015)
-        tp1 = close * 0.985
-        tp2 = close * 0.970
-        tp3 = close * 0.950
+        stop, tp1, tp2, tp3 = smart_tp_sl_levels(df, direction, close)
+        reasons.append("Smart TP/SL: SL above nearby resistance/swing with ATR buffer; TP targets nearby support/liquidity zones.")
     else:
         direction = "WAIT"
         rating = "⚪ NEUTRAL"

@@ -119,7 +119,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def home():
-    return "CRYPTO LUV Bot is running ✅"
+    return "INFLUENCERTECH SIGNALS Bot is running ✅"
 
 
 @app.post("/webhook")
@@ -182,14 +182,6 @@ def delete_webhook():
     return jsonify(response.json())
 
 
-
-@app.get("/webhook_info")
-def webhook_info():
-    """Check current Telegram webhook status."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
-    response = requests.get(url, timeout=20)
-    return jsonify(response.json())
-
 @app.get("/check_news")
 def check_news():
     if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
@@ -212,12 +204,51 @@ def mt5_orders():
     if not code:
         return jsonify({"ok": False, "error": "Missing EA code"}), 400
 
+    # Mark EA as connected every time it pulls orders.
+    users = bot_module.load_json(bot_module.MT5_USERS_FILE, {})
+    matched_user = None
+    for uid, profile in users.items():
+        if profile.get("bridge_code") == code:
+            profile["enabled"] = True
+            profile["last_seen_at"] = bot_module.now_utc().isoformat()
+            profile.setdefault("lot_size", 0.01)
+            profile.setdefault("max_active_orders", bot_module.MAX_ACTIVE_MT5_ORDERS)
+            users[uid] = profile
+            matched_user = uid
+            break
+    if matched_user:
+        bot_module.save_json(bot_module.MT5_USERS_FILE, users)
+
     orders = bot_module.load_json(bot_module.MT5_ORDERS_FILE, [])
     pending = [
         o for o in orders
         if o.get("bridge_code") == code and o.get("status") == "PENDING_TO_BRIDGE"
     ]
-    return jsonify({"ok": True, "orders": pending[:10]})
+    return jsonify({"ok": True, "connected": bool(matched_user), "orders": pending[:10]})
+
+
+@app.post("/mt5_heartbeat")
+def mt5_heartbeat():
+    """EA calls this every 30-60 seconds to keep connection status live."""
+    data = request.get_json(force=True, silent=True) or {}
+    code = str(data.get("code") or request.args.get("code", "")).strip()
+    if not code:
+        return jsonify({"ok": False, "error": "Missing EA code"}), 400
+
+    users = bot_module.load_json(bot_module.MT5_USERS_FILE, {})
+    for uid, profile in users.items():
+        if profile.get("bridge_code") == code:
+            profile["enabled"] = True
+            profile["last_seen_at"] = bot_module.now_utc().isoformat()
+            profile["account"] = data.get("account", profile.get("account"))
+            profile["broker"] = data.get("broker", profile.get("broker"))
+            profile["terminal_connected"] = bool(data.get("terminal_connected", True))
+            profile["updated_at"] = bot_module.now_utc().isoformat()
+            users[uid] = profile
+            bot_module.save_json(bot_module.MT5_USERS_FILE, users)
+            return jsonify({"ok": True, "message": "EA heartbeat saved"})
+
+    return jsonify({"ok": False, "error": "Invalid EA code"}), 404
 
 
 def _parse_mt5_status_payload():

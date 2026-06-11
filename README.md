@@ -1,44 +1,34 @@
-CRYPTO LUV Updated Telegram Signal Bot
-This package is Render-ready and keeps the restored bot updates:
-Premium button and premium signals
-Referral links and 1-day premium reward after invited user activates premium
-Crypto, forex, stocks and metals scanning
-Gold XAU/USD, Silver XAG/USD, Platinum XPT/USD, Palladium XPD/USD
-Signal grading:
-79-84% = B SIGNAL
-85-89% = A SIGNAL
-90%+ = A+ SIGNAL
-VIP history and performance
-TP/SL tracking/maintenance endpoint
-Admin broadcast
-Admin stats
-MT5 bridge endpoints
-M-Pesa callback route
-Python pinned to 3.11 to avoid pandas build failure on Render Python 3.14
-Render setup
-Build command:
-```bash
-pip install -r requirements.txt
-```
-Start command:
-```bash
-gunicorn app:app
-```
-Add environment variables from `.env.example`.
-Important:
-```text
+CRYPTO LUV BOT FIXES
+
+1) MT5 link fixed per user
+- /mt5link now creates a stable code: BRIDGE-USERID
+- It no longer uses timestamp, so it will not change after restart/redeploy.
+- IMPORTANT: Render free disk can reset JSON files after redeploy. This update still keeps the code stable even if mt5_users.json is lost.
+
+2) Premium signal sending fixed
+- Premium scan now sends a scanning message first.
+- Scans crypto, forex, metals and stocks.
+- Sends every found signal up to PREMIUM_DAILY_LIMIT.
+- No more saying found 5 then only sending 2 because it no longer re-analyzes each signal before sending.
+
+3) Premium grading fixed
+- 79-84 confidence = B SIGNAL
+- 85-89 confidence = A SIGNAL
+- 90+ confidence = A+ SIGNAL
+
+4) Metals included
+- XAU/USD Gold
+- XAG/USD Silver
+- XPT/USD Platinum
+- XPD/USD Palladium
+
+Recommended Render ENV:
 PUBLIC_URL=https://cryptoluv.onrender.com
-```
-After deploy, open:
-```text
-https://cryptoluv.onrender.com/set_webhook
-```
-Check webhook:
-```text
-https://cryptoluv.onrender.com/webhook_info
-```
-Cron URL for news and VIP maintenance:
-```text
-https://cryptoluv.onrender.com/check_news?secret=YOUR_CRON_SECRET
-```
-Set this cron every 5 minutes using UptimeRobot or cron-job.org.
+PREMIUM_MIN_CONFIDENCE=79
+A_SIGNAL_MIN_CONFIDENCE=85
+A_PLUS_MIN_CONFIDENCE=90
+PREMIUM_DAILY_LIMIT=5
+PREMIUM_CRYPTO_SCAN_LIMIT=30
+PREMIUM_FOREX_SCAN_LIMIT=24
+PREMIUM_STOCK_SCAN_LIMIT=20
+MAX_ACTIVE_MT5_ORDERS=4

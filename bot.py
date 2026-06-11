@@ -130,12 +130,10 @@ STOCK_WATCHLIST = [
 ]
 
 YAHOO_SYMBOL_MAP = {
-    # Metals: Yahoo spot symbols are unreliable in yfinance. Use liquid futures as reference fallback.
-    # The signal entry is refreshed from the latest quote before sending.
+    # Metals: use spot-style symbols for MT5/forex signals, not COMEX futures (GC=F/SI=F).
     "XAUUSD": "GC=F", "GOLD": "GC=F", "XAU/USD": "GC=F",
     "XAGUSD": "SI=F", "SILVER": "SI=F", "XAG/USD": "SI=F",
-    "XPTUSD": "PL=F", "XPT/USD": "PL=F",
-    "XPDUSD": "PA=F", "XPD/USD": "PA=F",
+    "XPTUSD": "XPTUSD=X", "XPDUSD": "XPDUSD=X",
 
     # Major and cross forex pairs.
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
@@ -1160,23 +1158,18 @@ def yahoo_symbol(symbol: str):
 
 
 def yahoo_symbol_candidates(symbol: str):
-    """Return Yahoo symbols to try, in order. This prevents XAUUSD/XAGUSD failures."""
+    """Yahoo fallback list for metals that fail under raw MT5 names."""
     clean = clean_symbol(symbol)
     primary = yahoo_symbol(clean)
-    candidates = [primary]
-
     fallback_map = {
         "XAUUSD": ["GC=F", "XAUUSD=X"],
         "GOLD": ["GC=F", "XAUUSD=X"],
         "XAGUSD": ["SI=F", "XAGUSD=X"],
         "SILVER": ["SI=F", "XAGUSD=X"],
-        "XPTUSD": ["PL=F", "XPTUSD=X"],
-        "XPDUSD": ["PA=F", "XPDUSD=X"],
     }
-    candidates.extend(fallback_map.get(clean, []))
+    items = [primary] + fallback_map.get(clean, [])
+    return list(dict.fromkeys([x for x in items if x]))
 
-    # Remove duplicates but preserve order.
-    return list(dict.fromkeys([c for c in candidates if c]))
 
 
 def fetch_binance_live_price(symbol: str):
@@ -1222,13 +1215,8 @@ def fetch_okx_live_price(symbol: str):
 
 
 def fetch_yahoo_live_price(symbol: str):
-    """Fresh forex/metals/stocks reference price from Yahoo Finance.
-
-    Tries mapped Yahoo tickers and fallbacks. This fixes XAUUSD/XAGUSD failures
-    where Yahoo rejects the raw MT5-style symbol.
-    """
+    """Fresh forex/metals/stocks reference price from Yahoo Finance."""
     clean = clean_symbol(symbol)
-
     for yf_symbol in yahoo_symbol_candidates(clean):
         try:
             ticker = yf.Ticker(yf_symbol)
@@ -1237,15 +1225,11 @@ def fetch_yahoo_live_price(symbol: str):
                 price = info.get(key) if hasattr(info, "get") else None
                 if price:
                     return float(price)
-
             hist = ticker.history(period="1d", interval="1m")
             if hist is not None and not hist.empty:
-                close_series = hist["Close"].dropna()
-                if not close_series.empty:
-                    return float(close_series.iloc[-1])
+                return float(hist["Close"].dropna().iloc[-1])
         except Exception as e:
             logger.warning("Yahoo live price failed for %s via %s: %s", clean, yf_symbol, e)
-
     return None
 
 
@@ -1643,31 +1627,7 @@ def detect_order_block(df: pd.DataFrame):
     return "No clear order block"
 
 
-
-def ensure_live_price_not_stale(df: pd.DataFrame, symbol: str, asset_type: str = None, max_diff=0.006):
-    """Reject or resync if last candle price is far from fresh live price.
-
-    max_diff 0.006 = 0.6%. This stops signals like XAUUSD 4120 when live is 4090.
-    """
-    live = get_live_market_price(symbol, asset_type)
-    if not live or df.empty:
-        return df
-
-    df = df.copy()
-    old_close = float(df.iloc[-1]["close"])
-    if old_close and abs(live - old_close) / old_close > max_diff:
-        logger.warning("Stale price corrected for %s: candle %.6g -> live %.6g", clean_symbol(symbol), old_close, live)
-
-    i = df.index[-1]
-    df.at[i, "close"] = float(live)
-    df.at[i, "high"] = max(float(df.at[i, "high"]), float(live))
-    df.at[i, "low"] = min(float(df.at[i, "low"]), float(live))
-    return df
-
-
 def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_free=True, return_meta=False):
-    # Final live-price sync before producing/sending any signal.
-    df = ensure_live_price_not_stale(df, symbol, symbol_profile(symbol))
     df = add_indicators(df)
     last = df.iloc[-1]
 
@@ -2464,8 +2424,7 @@ async def mt5status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Enabled: `{profile.get('enabled', False)}`\n"
         f"EA Code: `{profile.get('bridge_code', 'None')}`\n"
         f"Lot Size: `{profile.get('lot_size', 0.01)}`\n"
-        f"Active/Pending Orders: `{active_count}/{mt5_max_trades(update.effective_user.id)}`\n"
-        f"EA Connected Now: `{mt5_is_connected(update.effective_user.id)[0]}`",
+        f"Active/Pending Orders: `{active_count}/{mt5_max_trades(update.effective_user.id)}`",
         parse_mode="Markdown",
     )
 

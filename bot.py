@@ -49,6 +49,11 @@ MT5_ORDERS_FILE = "mt5_orders.json"
 AUTO_VIP_FILE = "auto_vip_last_sent.json"
 MARKET_CACHE_FILE = "market_cache.json"
 CACHE_MINUTES = int(os.getenv("CACHE_MINUTES", "1") or 1)
+# Optional broker-price adjustment. Use this if your MT5 broker spot XAU/XAG differs from Yahoo futures.
+# Example: if bot shows XAUUSD 4129 but broker shows 4104, set XAUUSD_PRICE_OFFSET=-25
+XAUUSD_PRICE_OFFSET = float(os.getenv("XAUUSD_PRICE_OFFSET", "0") or 0)
+XAGUSD_PRICE_OFFSET = float(os.getenv("XAGUSD_PRICE_OFFSET", "0") or 0)
+
 A_PLUS_MIN_CONFIDENCE = int(os.getenv("A_PLUS_MIN_CONFIDENCE", "90") or 90)
 A_SIGNAL_MIN_CONFIDENCE = int(os.getenv("A_SIGNAL_MIN_CONFIDENCE", "85") or 85)
 
@@ -1214,6 +1219,58 @@ def fetch_okx_live_price(symbol: str):
     return None
 
 
+
+def fetch_stooq_metal_live_price(symbol: str):
+    """Try to get spot-style metal price from Stooq.
+
+    This is used only for the final live price on metals so XAUUSD/XAGUSD
+    does not follow Yahoo futures too far away from broker spot price.
+    """
+    clean = clean_symbol(symbol)
+    stooq_map = {
+        "XAUUSD": "xauusd",
+        "GOLD": "xauusd",
+        "XAGUSD": "xagusd",
+        "SILVER": "xagusd",
+    }
+    stooq_symbol = stooq_map.get(clean)
+    if not stooq_symbol:
+        return None
+
+    try:
+        url = "https://stooq.com/q/l/"
+        params = {"s": stooq_symbol, "f": "sd2t2ohlcv", "h": "", "e": "csv"}
+        r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r.raise_for_status()
+        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
+        if len(lines) < 2:
+            return None
+        headers = [h.strip().lower() for h in lines[0].split(",")]
+        values = [v.strip() for v in lines[1].split(",")]
+        row = dict(zip(headers, values))
+        for key in ["close", "open", "high", "low"]:
+            val = row.get(key)
+            if val and val.upper() != "N/D":
+                price = float(val)
+                if price > 0:
+                    return price
+    except Exception as e:
+        logger.warning("Stooq metal live price failed for %s: %s", clean, e)
+    return None
+
+
+def apply_broker_price_offset(symbol: str, price: float):
+    """Optional final adjustment to match your broker's MT5 price."""
+    if not price:
+        return price
+    clean = clean_symbol(symbol)
+    if clean in ["XAUUSD", "GOLD"]:
+        return float(price) + XAUUSD_PRICE_OFFSET
+    if clean in ["XAGUSD", "SILVER"]:
+        return float(price) + XAGUSD_PRICE_OFFSET
+    return float(price)
+
+
 def fetch_yahoo_live_price(symbol: str):
     """Fresh forex/metals/stocks reference price from Yahoo Finance."""
     clean = clean_symbol(symbol)
@@ -1234,11 +1291,21 @@ def fetch_yahoo_live_price(symbol: str):
 
 
 def get_live_market_price(symbol: str, asset_type: str = None):
-    """Universal live-price layer used before every signal is sent."""
+    """Universal live-price layer used before every signal is sent.
+
+    Metals use spot-style Stooq first, then Yahoo fallback. This prevents XAUUSD
+    from using GC=F futures as the final displayed entry price.
+    """
     clean = clean_symbol(symbol)
     at = (asset_type or "").lower()
+
+    if clean in ["XAUUSD", "GOLD", "XAGUSD", "SILVER"] or at in ["metal", "metals"]:
+        price = fetch_stooq_metal_live_price(clean) or fetch_yahoo_live_price(clean)
+        return apply_broker_price_offset(clean, price)
+
     if at == "crypto" or clean.endswith("USDT") or clean in ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD"]:
         return fetch_binance_live_price(clean) or fetch_okx_live_price(clean)
+
     return fetch_yahoo_live_price(clean)
 
 

@@ -4,7 +4,7 @@ CRYPTO LUV BOT FIXES
 - /mt5link now creates a stable code: BRIDGE-USERID
 - It no longer uses timestamp, so it will not change after restart/redeploy.
 - IMPORTANT: Render free disk can reset JSON files after redeploy. This update still keeps the code stable even if mt5_users.json is lost.
-a
+
 2) Premium signal sending fixed
 - Premium scan now sends a scanning message first.
 - Scans crypto, forex, metals and stocks.

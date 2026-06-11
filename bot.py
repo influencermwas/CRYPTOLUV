@@ -48,7 +48,7 @@ MT5_USERS_FILE = "mt5_users.json"
 MT5_ORDERS_FILE = "mt5_orders.json"
 AUTO_VIP_FILE = "auto_vip_last_sent.json"
 MARKET_CACHE_FILE = "market_cache.json"
-CACHE_MINUTES = int(os.getenv("CACHE_MINUTES", "15") or 15)
+CACHE_MINUTES = int(os.getenv("CACHE_MINUTES", "1") or 1)
 A_PLUS_MIN_CONFIDENCE = int(os.getenv("A_PLUS_MIN_CONFIDENCE", "90") or 90)
 A_SIGNAL_MIN_CONFIDENCE = int(os.getenv("A_SIGNAL_MIN_CONFIDENCE", "85") or 85)
 
@@ -130,24 +130,23 @@ STOCK_WATCHLIST = [
 ]
 
 YAHOO_SYMBOL_MAP = {
-    "XAUUSD": "GC=F",
-    "XAGUSD": "SI=F",
-    "XPTUSD": "PL=F",
-    "XPDUSD": "PA=F",
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "JPY=X",
-    "USDCAD": "CAD=X",
-    "AUDUSD": "AUDUSD=X",
-    "NZDUSD": "NZDUSD=X",
-    "USDCHF": "CHF=X",
-    "GBPJPY": "GBPJPY=X",
-    "EURJPY": "EURJPY=X",
-    "EURGBP": "EURGBP=X",
-    "EURAUD": "EURAUD=X",
-    "AUDJPY": "AUDJPY=X",
-    "CADJPY": "CADJPY=X",
-    "CHFJPY": "CHFJPY=X",
+    # Metals: use spot-style symbols for MT5/forex signals, not COMEX futures (GC=F/SI=F).
+    "XAUUSD": "XAUUSD=X", "GOLD": "XAUUSD=X", "XAU/USD": "XAUUSD=X",
+    "XAGUSD": "XAGUSD=X", "SILVER": "XAGUSD=X", "XAG/USD": "XAGUSD=X",
+    "XPTUSD": "XPTUSD=X", "XPDUSD": "XPDUSD=X",
+
+    # Major and cross forex pairs.
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
+    "USDJPY": "JPY=X", "USDCAD": "CAD=X", "USDCHF": "CHF=X",
+    "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X", "EURGBP": "EURGBP=X", "EURAUD": "EURAUD=X",
+    "EURCAD": "EURCAD=X", "EURCHF": "EURCHF=X", "GBPCAD": "GBPCAD=X", "GBPCHF": "GBPCHF=X",
+    "AUDJPY": "AUDJPY=X", "AUDCAD": "AUDCAD=X", "AUDNZD": "AUDNZD=X",
+    "CADJPY": "CADJPY=X", "CHFJPY": "CHFJPY=X", "NZDJPY": "NZDJPY=X",
+
+    # Common index aliases used by MT5 brokers. These are reference feeds, not broker CFDs.
+    "US30": "^DJI", "DJ30": "^DJI", "DJI": "^DJI",
+    "NAS100": "^NDX", "NASDAQ100": "^NDX", "NDX": "^NDX",
+    "SPX500": "^GSPC", "US500": "^GSPC", "SP500": "^GSPC",
 }
 
 
@@ -206,6 +205,22 @@ def get_mt5_profile(user_id: int):
 def is_mt5_linked(user_id: int):
     profile = get_mt5_profile(user_id)
     return bool(profile.get("enabled") and profile.get("bridge_code"))
+
+
+def mt5_is_connected(user_id: int, max_age_seconds: int = 120):
+    """True only when the EA has contacted the bot recently."""
+    profile = get_mt5_profile(user_id)
+    last_seen = profile.get("last_seen_at")
+    if not last_seen:
+        return False, None
+    try:
+        seen = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        age = (now_utc() - seen).total_seconds()
+        return age <= max_age_seconds, seen
+    except Exception:
+        return False, None
 
 
 def mt5_lot_size(user_id: int):
@@ -306,7 +321,7 @@ def format_premium_signal_from_meta(meta: dict):
     return (
         f"💎 *VIP PREMIUM SIGNAL*\n"
         f"📊 *{symbol} Signal*\n"
-        f"🔥 *CRYPTO LUV SIGNALS* 🔥\n\n"
+        f"🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
         f"Rating: *{rating}*\n"
         f"Direction: *{direction}*\n"
         f"Current Price: `{current:.6g}`\n"
@@ -334,7 +349,7 @@ def format_premium_signal_from_meta(meta: dict):
         f"MTF Trend: `{mtf_text}`\n\n"
         "Reason:\n- " + "\n- ".join(reasons[:12]) +
         "\n\n━━━━━━━━━━━━━━━━━━\n"
-        "🔥 *CRYPTO LUV SIGNALS* 🔥\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n"
         "⚠️ This is analysis only, not guaranteed profit."
     )
 
@@ -342,7 +357,11 @@ def format_premium_signal_from_meta(meta: dict):
 def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
     """Queue a VIP signal for the user's laptop MT5 bridge. The laptop bridge pulls these orders."""
     if not is_mt5_linked(user_id):
-        return {"queued": False, "reason": "MT5 not linked"}
+        return {"queued": False, "reason": "MT5 not linked. Use /mt5link, then put the EA Code inside your MT5 EA."}
+
+    connected, seen = mt5_is_connected(user_id)
+    if not connected:
+        return {"queued": False, "reason": "EA not connected now. Open MT5, attach the EA, enable Algo Trading and allow WebRequest."}
 
     active_count = active_mt5_order_count(user_id)
     max_trades = mt5_max_trades(user_id)
@@ -1088,6 +1107,7 @@ def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
     df = pd.DataFrame(rows)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
+    df = sync_last_close_with_live_price(df, symbol, "crypto")
     return df
 
 
@@ -1135,6 +1155,97 @@ def finnhub_resolution(interval="15"):
 def yahoo_symbol(symbol: str):
     clean = clean_symbol(symbol)
     return YAHOO_SYMBOL_MAP.get(clean, clean)
+
+
+def fetch_binance_live_price(symbol: str):
+    """Fresh crypto price from Binance ticker. Falls back safely if unavailable."""
+    clean = clean_symbol(symbol)
+    if clean.endswith("USD") and not clean.endswith("USDT"):
+        clean = clean[:-3] + "USDT"
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": clean},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        price = float(r.json().get("price", 0) or 0)
+        if price > 0:
+            return price
+    except Exception as e:
+        logger.warning("Binance live price failed for %s: %s", clean, e)
+    return None
+
+
+def fetch_okx_live_price(symbol: str):
+    """Fallback crypto price from OKX ticker."""
+    inst_id = to_okx_symbol(symbol)
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/ticker",
+            params={"instId": inst_id},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if data:
+            price = float(data[0].get("last", 0) or 0)
+            if price > 0:
+                return price
+    except Exception as e:
+        logger.warning("OKX live price failed for %s: %s", inst_id, e)
+    return None
+
+
+def fetch_yahoo_live_price(symbol: str):
+    """Fresh forex/metals/stocks reference price from Yahoo Finance."""
+    clean = clean_symbol(symbol)
+    yf_symbol = yahoo_symbol(clean)
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        info = getattr(ticker, "fast_info", {}) or {}
+        for key in ["last_price", "lastPrice", "regular_market_price", "regularMarketPrice"]:
+            price = info.get(key) if hasattr(info, "get") else None
+            if price:
+                return float(price)
+        hist = ticker.history(period="1d", interval="1m")
+        if hist is not None and not hist.empty:
+            return float(hist["Close"].dropna().iloc[-1])
+    except Exception as e:
+        logger.warning("Yahoo live price failed for %s: %s", clean, e)
+    return None
+
+
+def get_live_market_price(symbol: str, asset_type: str = None):
+    """Universal live-price layer used before every signal is sent."""
+    clean = clean_symbol(symbol)
+    at = (asset_type or "").lower()
+    if at == "crypto" or clean.endswith("USDT") or clean in ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD"]:
+        return fetch_binance_live_price(clean) or fetch_okx_live_price(clean)
+    return fetch_yahoo_live_price(clean)
+
+
+def sync_last_close_with_live_price(df: pd.DataFrame, symbol: str, asset_type: str = None):
+    """Force the signal entry/current price to the freshest live quote.
+
+    Candle history is still used for structure, RSI, EMA, FVG and ATR, but the last
+    candle close is overwritten with the live quote so the displayed signal price
+    does not drift away from the current market feed.
+    """
+    clean = clean_symbol(symbol)
+    live = get_live_market_price(clean, asset_type)
+    if live and not df.empty:
+        df = df.copy()
+        i = df.index[-1]
+        old_close = float(df.at[i, "close"])
+        df.at[i, "close"] = live
+        df.at[i, "high"] = max(float(df.at[i, "high"]), live)
+        df.at[i, "low"] = min(float(df.at[i, "low"]), live)
+        if old_close and abs(live - old_close) / old_close > 0.001:
+            logger.warning("Live price sync for %s: candle %.6g -> live %.6g", clean, old_close, live)
+    return df
 
 
 def _normalize_yahoo_df(raw: pd.DataFrame, candles: int):
@@ -1193,7 +1304,7 @@ def fetch_yahoo_klines(symbol: str, asset_type: str, interval="15m", outputsize=
     if cached:
         saved_at = parse_dt(cached.get("saved_at"))
         if saved_at and now_utc() - saved_at < timedelta(minutes=CACHE_MINUTES):
-            return pd.DataFrame(cached.get("rows", []))
+            return sync_last_close_with_live_price(pd.DataFrame(cached.get("rows", [])), clean, asset_type)
 
     period = "30d" if interval in ["15m", "30m", "60m", "1h"] else "1y"
 
@@ -1207,10 +1318,11 @@ def fetch_yahoo_klines(symbol: str, asset_type: str, interval="15m", outputsize=
             threads=False,
         )
         df = _normalize_yahoo_df(raw, outputsize)
+        df = sync_last_close_with_live_price(df, clean, asset_type)
     except Exception as e:
         if cached and cached.get("rows"):
             logger.warning("Yahoo fetch failed for %s, using cache: %s", clean, e)
-            return pd.DataFrame(cached.get("rows", []))
+            return sync_last_close_with_live_price(pd.DataFrame(cached.get("rows", [])), clean, asset_type)
         raise ValueError(f"Yahoo Finance data failed for {clean}: {e}")
 
     cache[cache_key] = {
@@ -1269,6 +1381,77 @@ def add_atr(df: pd.DataFrame, period=14):
     return df
 
 
+
+def clamp(value: float, minimum: float, maximum: float):
+    return max(minimum, min(maximum, value))
+
+
+def symbol_profile(symbol: str):
+    clean = clean_symbol(symbol)
+    if clean in ["XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD", "GOLD", "SILVER"]:
+        return "metal"
+    if clean.endswith("USDT") or clean in ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD"]:
+        return "crypto"
+    if len(clean) == 6 and clean[:3].isalpha() and clean[3:].isalpha():
+        return "forex"
+    return "stock"
+
+
+def smart_distance_profile(symbol: str):
+    """Minimum/maximum distances keep levels realistic: not too close, not too far."""
+    profile = symbol_profile(symbol)
+    if profile == "crypto":
+        return {"entry": 0.0015, "min_sl": 0.0035, "max_sl": 0.022, "tp1": 0.006, "tp2": 0.012, "tp3": 0.022}
+    if profile == "metal":
+        return {"entry": 0.0010, "min_sl": 0.0018, "max_sl": 0.010, "tp1": 0.0035, "tp2": 0.007, "tp3": 0.012}
+    if profile == "forex":
+        return {"entry": 0.0008, "min_sl": 0.0012, "max_sl": 0.007, "tp1": 0.0020, "tp2": 0.004, "tp3": 0.007}
+    return {"entry": 0.0015, "min_sl": 0.0030, "max_sl": 0.018, "tp1": 0.006, "tp2": 0.012, "tp3": 0.020}
+
+
+def calculate_smart_levels(df: pd.DataFrame, symbol: str, direction: str, close: float, support: float, resistance: float):
+    """Structure + ATR TP/SL.
+
+    BUY: SL below recent swing/support with ATR buffer; TP goes to nearby resistance/liquidity.
+    SELL: SL above recent swing/resistance with ATR buffer; TP goes to nearby support/liquidity.
+    Distances are capped so targets are not unrealistic and protected by minimums so SL is not too tight.
+    """
+    prof = smart_distance_profile(symbol)
+    atr_df = add_atr(df)
+    atr = float(atr_df["atr"].dropna().iloc[-1]) if not atr_df["atr"].dropna().empty else close * prof["min_sl"]
+    atr_pct = atr / close if close else prof["min_sl"]
+
+    recent = df.tail(30)
+    swing_low = float(recent["low"].min())
+    swing_high = float(recent["high"].max())
+
+    entry_pad = close * prof["entry"]
+    min_sl_dist = close * prof["min_sl"]
+    max_sl_dist = close * prof["max_sl"]
+
+    base_sl_dist = clamp(max(atr * 1.15, min_sl_dist), min_sl_dist, max_sl_dist)
+
+    if "SELL" in direction:
+        structural_sl = max(resistance, swing_high) + atr * 0.25
+        sl_dist = clamp(max(structural_sl - close, base_sl_dist), min_sl_dist, max_sl_dist)
+        stop = close + sl_dist
+
+        raw_tp1 = min(support, swing_low) if min(support, swing_low) < close else close - max(atr * 1.05, close * prof["tp1"])
+        tp1_dist = clamp(max(close - raw_tp1, close * prof["tp1"], atr * 1.05), close * prof["tp1"], close * prof["tp3"])
+        tp2_dist = clamp(max(tp1_dist * 1.65, atr * 1.8), tp1_dist * 1.25, close * prof["tp3"] * 1.45)
+        tp3_dist = clamp(max(tp2_dist * 1.45, atr * 2.6), tp2_dist * 1.2, close * prof["tp3"] * 2.0)
+        return close - entry_pad, close + entry_pad, stop, close - tp1_dist, close - tp2_dist, close - tp3_dist
+
+    structural_sl = min(support, swing_low) - atr * 0.25
+    sl_dist = clamp(max(close - structural_sl, base_sl_dist), min_sl_dist, max_sl_dist)
+    stop = close - sl_dist
+
+    raw_tp1 = max(resistance, swing_high) if max(resistance, swing_high) > close else close + max(atr * 1.05, close * prof["tp1"])
+    tp1_dist = clamp(max(raw_tp1 - close, close * prof["tp1"], atr * 1.05), close * prof["tp1"], close * prof["tp3"])
+    tp2_dist = clamp(max(tp1_dist * 1.65, atr * 1.8), tp1_dist * 1.25, close * prof["tp3"] * 1.45)
+    tp3_dist = clamp(max(tp2_dist * 1.45, atr * 2.6), tp2_dist * 1.2, close * prof["tp3"] * 2.0)
+    return close - entry_pad, close + entry_pad, stop, close + tp1_dist, close + tp2_dist, close + tp3_dist
+
 def risk_reward_ratio(direction: str, entry: float, stop: float, target: float):
     try:
         if "SELL" in direction:
@@ -1282,110 +1465,6 @@ def risk_reward_ratio(direction: str, entry: float, stop: float, target: float):
         return reward / risk
     except Exception:
         return 0
-
-
-def _safe_float(value, fallback=0.0):
-    try:
-        value = float(value)
-        if math.isnan(value) or math.isinf(value):
-            return fallback
-        return value
-    except Exception:
-        return fallback
-
-
-def _clamp(value: float, low: float, high: float):
-    return max(low, min(high, value))
-
-
-def _recent_structure_levels(df: pd.DataFrame, close: float, lookback=80):
-    """Return practical nearby support/resistance levels from recent candles.
-    This avoids TP/SL being placed too far away from current market price.
-    """
-    recent = df.tail(lookback).copy()
-    supports = []
-    resistances = []
-
-    for i in range(2, len(recent) - 2):
-        low = _safe_float(recent["low"].iloc[i])
-        high = _safe_float(recent["high"].iloc[i])
-        if low <= recent["low"].iloc[i-2:i+3].min():
-            supports.append(low)
-        if high >= recent["high"].iloc[i-2:i+3].max():
-            resistances.append(high)
-
-    # Always include recent range levels as fallback.
-    supports.extend([_safe_float(recent["low"].tail(20).min()), _safe_float(recent["low"].tail(50).min())])
-    resistances.extend([_safe_float(recent["high"].tail(20).max()), _safe_float(recent["high"].tail(50).max())])
-
-    supports = sorted({x for x in supports if x and x < close}, reverse=True)
-    resistances = sorted({x for x in resistances if x and x > close})
-    return supports, resistances
-
-
-def smart_tp_sl_levels(df: pd.DataFrame, direction: str, close: float):
-    """Smart TP/SL engine for INFLUENCERTECH SIGNALS.
-
-    Logic:
-    - SL uses nearby swing/support/resistance plus small ATR buffer.
-    - TP1 uses nearest realistic liquidity/support/resistance target.
-    - TP2/TP3 extend gradually, but are capped by ATR so they are not too far.
-    - Minimum distance is also protected so SL/TP are not too tight.
-    """
-    df_atr = add_atr(df)
-    atr = _safe_float(df_atr["atr"].iloc[-1], close * 0.006)
-    if atr <= 0:
-        atr = close * 0.006
-
-    supports, resistances = _recent_structure_levels(df, close)
-
-    # Balanced scalping/swing distances. These keep levels realistic.
-    min_sl = 0.75 * atr
-    max_sl = 1.80 * atr
-    min_tp1 = 0.80 * atr
-    max_tp1 = 2.00 * atr
-    max_tp2 = 3.20 * atr
-    max_tp3 = 4.80 * atr
-    buffer = 0.25 * atr
-
-    if "SELL" in direction:
-        nearest_resistance = resistances[0] if resistances else close + atr
-        raw_stop = nearest_resistance + buffer
-        stop_distance = _clamp(raw_stop - close, min_sl, max_sl)
-        stop = close + stop_distance
-
-        target_candidates = [x for x in supports if close - max_tp3 <= x <= close - min_tp1]
-        tp1 = target_candidates[0] if target_candidates else close - (1.15 * atr)
-        tp1_distance = _clamp(close - tp1, min_tp1, max_tp1)
-        tp1 = close - tp1_distance
-
-        tp2_raw = target_candidates[1] if len(target_candidates) > 1 else close - (2.20 * atr)
-        tp2_distance = _clamp(close - tp2_raw, tp1_distance + 0.60 * atr, max_tp2)
-        tp2 = close - tp2_distance
-
-        tp3_raw = target_candidates[2] if len(target_candidates) > 2 else close - (3.40 * atr)
-        tp3_distance = _clamp(close - tp3_raw, tp2_distance + 0.70 * atr, max_tp3)
-        tp3 = close - tp3_distance
-    else:
-        nearest_support = supports[0] if supports else close - atr
-        raw_stop = nearest_support - buffer
-        stop_distance = _clamp(close - raw_stop, min_sl, max_sl)
-        stop = close - stop_distance
-
-        target_candidates = [x for x in resistances if close + min_tp1 <= x <= close + max_tp3]
-        tp1 = target_candidates[0] if target_candidates else close + (1.15 * atr)
-        tp1_distance = _clamp(tp1 - close, min_tp1, max_tp1)
-        tp1 = close + tp1_distance
-
-        tp2_raw = target_candidates[1] if len(target_candidates) > 1 else close + (2.20 * atr)
-        tp2_distance = _clamp(tp2_raw - close, tp1_distance + 0.60 * atr, max_tp2)
-        tp2 = close + tp2_distance
-
-        tp3_raw = target_candidates[2] if len(target_candidates) > 2 else close + (3.40 * atr)
-        tp3_distance = _clamp(tp3_raw - close, tp2_distance + 0.70 * atr, max_tp3)
-        tp3 = close + tp3_distance
-
-    return stop, tp1, tp2, tp3
 
 
 def is_active_trading_session(asset_type: str):
@@ -1627,22 +1706,17 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
     if bullish > bearish:
         direction = "BUY / LONG"
         rating = "🟢 STRONG BUY" if bullish - bearish >= 4 else "🟡 BUY"
-        entry_low = close * 0.998
-        entry_high = close * 1.002
-        stop, tp1, tp2, tp3 = smart_tp_sl_levels(df, direction, close)
-        reasons.append("Smart TP/SL: SL below nearby support/swing with ATR buffer; TP targets nearby resistance/liquidity zones.")
+        entry_low, entry_high, stop, tp1, tp2, tp3 = calculate_smart_levels(df, symbol, direction, close, support, resistance)
     elif bearish > bullish:
         direction = "SELL / SHORT"
         rating = "🔴 STRONG SELL" if bearish - bullish >= 4 else "🟠 SELL"
-        entry_low = close * 0.998
-        entry_high = close * 1.002
-        stop, tp1, tp2, tp3 = smart_tp_sl_levels(df, direction, close)
-        reasons.append("Smart TP/SL: SL above nearby resistance/swing with ATR buffer; TP targets nearby support/liquidity zones.")
+        entry_low, entry_high, stop, tp1, tp2, tp3 = calculate_smart_levels(df, symbol, direction, close, support, resistance)
     else:
         direction = "WAIT"
         rating = "⚪ NEUTRAL"
-        entry_low = close
-        entry_high = close
+        prof = smart_distance_profile(symbol)
+        entry_low = close * (1 - prof["entry"])
+        entry_high = close * (1 + prof["entry"])
         stop = support
         tp1 = resistance
         tp2 = resistance
@@ -1736,6 +1810,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         f"Rating: *{rating}*\n"
         f"Direction: *{direction}*\n"
         f"Current Price: `{close:.6g}`\n"
+        f"Price Source: `Live synced before sending`\n"
         f"Entry Zone: `{entry_low:.6g} - {entry_high:.6g}`\n"
         f"Stop Loss: `{stop:.6g}`\n"
         f"Take Profit 1: `{tp1:.6g}`\n"
@@ -2181,7 +2256,7 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
                 except Exception:
                     mtf[tf_label] = "Unavailable"
             meta = generate_signal(df, symbol, mtf=mtf, vip=True, lock_free=False, return_meta=True)
-    elif asset_type in ["forex", "stock"]:
+    elif asset_type in ["forex", "stock", "metal", "metals", "index", "indices"]:
         df = fetch_yahoo_klines(symbol, asset_type, "15m", 150)
         signal = generate_signal(df, symbol, mtf=None, vip=premium, lock_free=not premium)
         if premium:
@@ -2192,7 +2267,7 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
                 daily_trend = simple_trend(df)
             meta = add_quality_fields(meta, df, asset_type, daily_trend)
     else:
-        raise ValueError("Asset type must be crypto, forex, or stock.")
+        raise ValueError("Asset type must be crypto, forex, metal, index, or stock.")
 
     await context.bot.send_message(chat_id=chat_id, text=signal, parse_mode="Markdown")
     if premium and meta:

@@ -4,12 +4,19 @@ import json
 import math
 import base64
 import logging
+import io
 from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
 import yfinance as yf
 import feedparser
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -29,6 +36,14 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 NEWS_CHECK_MINUTES = int(os.getenv("NEWS_CHECK_MINUTES", "5") or 5)
 
 PREMIUM_PRICE = int(os.getenv("PREMIUM_PRICE", "35") or 35)
+PREMIUM_DAILY_PRICE = int(os.getenv("PREMIUM_DAILY_PRICE", str(PREMIUM_PRICE)) or PREMIUM_PRICE)
+PREMIUM_WEEKLY_PRICE = int(os.getenv("PREMIUM_WEEKLY_PRICE", "230") or 230)
+PREMIUM_MONTHLY_PRICE = int(os.getenv("PREMIUM_MONTHLY_PRICE", "999") or 999)
+PREMIUM_PLANS = {
+    "daily": {"label": "Daily", "price": PREMIUM_DAILY_PRICE, "hours": 24},
+    "weekly": {"label": "Weekly", "price": PREMIUM_WEEKLY_PRICE, "hours": 24 * 7},
+    "monthly": {"label": "Monthly", "price": PREMIUM_MONTHLY_PRICE, "hours": 24 * 30},
+}
 
 MPESA_ENV = os.getenv("MPESA_ENV", "sandbox").strip().lower()  # sandbox or live
 MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY", "").strip()
@@ -48,6 +63,8 @@ MT5_USERS_FILE = "mt5_users.json"
 MT5_ORDERS_FILE = "mt5_orders.json"
 AUTO_VIP_FILE = "auto_vip_last_sent.json"
 MARKET_CACHE_FILE = "market_cache.json"
+VIP_TRACKING_FILE = "vip_tracking.json"
+MARKET_BROADCAST_FILE = "market_broadcast_seen.json"
 CACHE_MINUTES = int(os.getenv("CACHE_MINUTES", "1") or 1)
 # Optional broker-price adjustment. Use this if your MT5 broker spot XAU/XAG differs from Yahoo futures.
 # Example: if bot shows XAUUSD 4129 but broker shows 4104, set XAUUSD_PRICE_OFFSET=-25
@@ -88,11 +105,23 @@ RISK_KEYWORDS = {
     "hack": "Security risk",
     "exchange hack": "Crypto exchange risk",
     "etf approval": "Crypto ETF catalyst",
+    "delist": "Exchange delisting alert",
+    "delisting": "Exchange delisting alert",
+    "listing": "Exchange listing alert",
+    "whale": "Whale movement alert",
+    "accumulating": "Whale accumulation alert",
+    "accumulation": "Whale accumulation alert",
+    "liquidation": "Liquidation alert",
+    "liquidations": "Liquidation alert",
+    "top gainer": "Top gainer alert",
+    "top loser": "Top loser alert",
 }
 
 NEWS_FEEDS = [
     "https://news.google.com/rss/search?q=war+OR+sanctions+OR+tariff+OR+trade+war+markets&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=crypto+bitcoin+ethereum+hack+ban+ETF&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=crypto+delisting+OR+delist+OR+listing+exchange&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=crypto+whale+accumulating+OR+accumulation+OR+liquidation&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=forex+fed+inflation+interest+rates+dollar&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=stocks+nasdaq+sp500+earnings+inflation+fed&hl=en-US&gl=US&ceid=US:en",
 ]
@@ -379,6 +408,13 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         return {"queued": False, "reason": "Signal is WAIT/neutral"}
 
     entry = (float(meta.get("entry_low")) + float(meta.get("entry_high"))) / 2
+    current_price = float(meta.get("current_price") or entry)
+    if "BUY" in direction:
+        order_type = "BUY_LIMIT" if entry <= current_price else "BUY_STOP"
+    elif "SELL" in direction:
+        order_type = "SELL_LIMIT" if entry >= current_price else "SELL_STOP"
+    else:
+        order_type = "NONE"
 
     order = {
         "order_id": make_order_id(user_id, meta.get("symbol")),
@@ -387,7 +423,7 @@ def queue_mt5_pending_order(user_id: int, asset_type: str, meta: dict):
         "asset_type": asset_type,
         "symbol": meta.get("symbol"),
         "direction": direction,
-        "order_type": "MARKET_BUY" if "BUY" in direction else "MARKET_SELL" if "SELL" in direction else "NONE",
+        "order_type": order_type,
         "lot_size": mt5_lot_size(user_id),
         "entry_price": entry,
         "entry_low": meta.get("entry_low"),
@@ -873,6 +909,26 @@ async def clearmt5(update, context):
         "✅ MT5 order queue cleared."
     )
 
+def get_premium_plan(plan_id: str):
+    return PREMIUM_PLANS.get(str(plan_id or "").lower(), PREMIUM_PLANS["daily"])
+
+
+def premium_plan_text():
+    return (
+        f"🟢 Daily: KSh {PREMIUM_PLANS['daily']['price']} - 1 day\n"
+        f"🔵 Weekly: KSh {PREMIUM_PLANS['weekly']['price']} - 7 days\n"
+        f"🟣 Monthly: KSh {PREMIUM_PLANS['monthly']['price']} - 30 days"
+    )
+
+
+def premium_plan_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🟢 Daily KSh {PREMIUM_PLANS['daily']['price']}", callback_data="payplan_daily")],
+        [InlineKeyboardButton(f"🔵 Weekly KSh {PREMIUM_PLANS['weekly']['price']}", callback_data="payplan_weekly")],
+        [InlineKeyboardButton(f"🟣 Monthly KSh {PREMIUM_PLANS['monthly']['price']}", callback_data="payplan_monthly")],
+    ])
+
+
 async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
     if active:
@@ -889,7 +945,7 @@ async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
         )
         return
 
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay KSh 35 via M-Pesa", callback_data="pay_premium")]])
+    keyboard = premium_plan_keyboard()
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
@@ -902,7 +958,7 @@ async def show_premium(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             "🔥 Stop loss\n"
             "🔥 CHoCH, BOS, FVG\n"
             "🔥 Order block and liquidity sweep\n\n"
-            "Tap below to pay automatically using STK Push."
+            "Tap your plan below to pay automatically using STK Push."
         ),
         parse_mode="Markdown",
         reply_markup=keyboard,
@@ -936,7 +992,7 @@ def get_mpesa_token():
     return r.json()["access_token"]
 
 
-def send_stk_push(user_id: int, phone: str):
+def send_stk_push(user_id: int, phone: str, plan_id: str = "daily"):
     if not MPESA_SHORTCODE or not MPESA_PASSKEY or not MPESA_CALLBACK_URL:
         raise ValueError("M-Pesa shortcode/passkey/callback URL missing in Render Environment Variables.")
 
@@ -948,18 +1004,21 @@ def send_stk_push(user_id: int, phone: str):
     url = f"{mpesa_base_url()}/mpesa/stkpush/v1/processrequest"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
+    plan = get_premium_plan(plan_id)
+    amount = int(plan["price"])
+
     payload = {
         "BusinessShortCode": MPESA_SHORTCODE,
         "Password": password,
         "Timestamp": timestamp,
         "TransactionType": MPESA_TRANSACTION_TYPE,
-        "Amount": PREMIUM_PRICE,
+        "Amount": amount,
         "PartyA": phone,
         "PartyB": MPESA_SHORTCODE,
         "PhoneNumber": phone,
         "CallBackURL": MPESA_CALLBACK_URL,
         "AccountReference": f"VIP{user_id}",
-        "TransactionDesc": "InfluencerTech VIP Signals",
+        "TransactionDesc": f"InfluencerTech VIP {plan['label']}",
     }
 
     r = requests.post(url, json=payload, headers=headers, timeout=30)
@@ -974,7 +1033,9 @@ def send_stk_push(user_id: int, phone: str):
     pending[checkout_id] = {
         "user_id": user_id,
         "phone": phone,
-        "amount": PREMIUM_PRICE,
+        "amount": amount,
+        "plan_id": plan_id,
+        "hours": plan["hours"],
         "created_at": now_utc().isoformat(),
     }
     save_json(PENDING_FILE, pending)
@@ -990,7 +1051,9 @@ async def handle_premium_phone(update: Update, context: ContextTypes.DEFAULT_TYP
         phone = normalize_phone(raw_phone)
         await update.message.reply_text("📲 Sending M-Pesa STK Push. Check your phone and enter PIN...")
 
-        data = send_stk_push(user_id, phone)
+        plan_id = context.user_data.get("premium_plan", "daily")
+        plan = get_premium_plan(plan_id)
+        data = send_stk_push(user_id, phone, plan_id)
         checkout_id = data.get("CheckoutRequestID", "pending")
 
         await update.message.reply_text(
@@ -1000,6 +1063,7 @@ async def handle_premium_phone(update: Update, context: ContextTypes.DEFAULT_TYP
             "After payment, premium will open automatically for 24 hours."
         )
         context.user_data["awaiting_premium_phone"] = False
+        context.user_data.pop("premium_plan", None)
         logger.info("STK sent to %s for user %s checkout %s", phone, user_id, checkout_id)
 
     except Exception as e:
@@ -1023,7 +1087,10 @@ async def handle_mpesa_callback(data: dict, bot):
     user_id = int(payment["user_id"])
 
     if result_code == 0:
-        expires = activate_premium(user_id, 24)
+        plan_id = payment.get("plan_id", "daily")
+        plan = get_premium_plan(plan_id)
+        hours = int(payment.get("hours") or plan["hours"])
+        expires = activate_premium(user_id, hours)
         pending.pop(checkout_id, None)
         save_json(PENDING_FILE, pending)
 
@@ -1079,7 +1146,73 @@ def interval_to_okx_bar(interval):
     return "15m"
 
 
-def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
+def interval_to_mexc_interval(interval):
+    interval = str(interval).lower()
+    if interval in ["1", "1m"]:
+        return "1m"
+    if interval in ["5", "5m"]:
+        return "5m"
+    if interval in ["15", "15m"]:
+        return "15m"
+    if interval in ["30", "30m"]:
+        return "30m"
+    if interval in ["60", "1h"]:
+        return "60m"
+    if interval in ["240", "4h"]:
+        return "4h"
+    if interval in ["1d", "d"]:
+        return "1d"
+    return "15m"
+
+
+def fetch_mexc_klines(symbol="BTCUSDT", interval="15", limit=150):
+    clean = clean_symbol(symbol)
+    mexc_interval = interval_to_mexc_interval(interval)
+    url = "https://api.mexc.com/api/v3/klines"
+    params = {"symbol": clean, "interval": mexc_interval, "limit": int(limit)}
+    r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    r.raise_for_status()
+    candles = r.json()
+    if not candles or not isinstance(candles, list):
+        raise Exception(f"No MEXC candle data returned for {clean}")
+    rows = []
+    for c in candles:
+        rows.append({
+            "time": datetime.fromtimestamp(int(c[0]) / 1000, tz=timezone.utc).isoformat(),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+        })
+    df = pd.DataFrame(rows)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col])
+    return sync_last_close_with_live_price(df, clean, "crypto")
+
+
+def fetch_mexc_live_price(symbol: str):
+    clean = clean_symbol(symbol)
+    if clean.endswith("USD") and not clean.endswith("USDT"):
+        clean = clean[:-3] + "USDT"
+    try:
+        r = requests.get(
+            "https://api.mexc.com/api/v3/ticker/price",
+            params={"symbol": clean},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        price = float(r.json().get("price", 0) or 0)
+        if price > 0:
+            return price
+    except Exception as e:
+        logger.warning("MEXC live price failed for %s: %s", clean, e)
+    return None
+
+
+
+def fetch_okx_klines(symbol="BTCUSDT", interval="15", limit=150):
     inst_id = to_okx_symbol(symbol)
     bar = interval_to_okx_bar(interval)
 
@@ -1114,6 +1247,21 @@ def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
         df[col] = pd.to_numeric(df[col])
     df = sync_last_close_with_live_price(df, symbol, "crypto")
     return df
+
+
+def fetch_crypto_klines(symbol="BTCUSDT", interval="15", limit=150):
+    """Crypto candles with OKX primary and MEXC fallback for more symbols."""
+    errors = []
+    for source_name, fn in [("OKX", fetch_okx_klines), ("MEXC", fetch_mexc_klines)]:
+        try:
+            df = fn(symbol, interval, limit)
+            if df is not None and not df.empty:
+                logger.info("Crypto data loaded for %s from %s", symbol, source_name)
+                return df
+        except Exception as e:
+            logger.warning("%s candles failed for %s: %s", source_name, symbol, e)
+            errors.append(f"{source_name}: {e}")
+    raise Exception("Symbol not available on OKX or MEXC. " + " | ".join(errors[-2:]))
 
 
 def fetch_binance_klines(symbol="BTCUSDT", interval="15", limit=150):
@@ -1304,7 +1452,7 @@ def get_live_market_price(symbol: str, asset_type: str = None):
         return apply_broker_price_offset(clean, price)
 
     if at == "crypto" or clean.endswith("USDT") or clean in ["BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD", "XRPUSD", "DOGEUSD"]:
-        return fetch_binance_live_price(clean) or fetch_okx_live_price(clean)
+        return fetch_binance_live_price(clean) or fetch_okx_live_price(clean) or fetch_mexc_live_price(clean)
 
     return fetch_yahoo_live_price(clean)
 
@@ -1611,6 +1759,7 @@ def add_quality_fields(meta: dict, df: pd.DataFrame, asset_type: str, daily_tren
         and meta.get("grade") != "IGNORE"
         and rr >= 1.5
         and meta["session_ok"]
+        and int(meta.get("confidence", 0) or 0) >= PREMIUM_MIN_CONFIDENCE
     )
     return meta
 
@@ -1813,7 +1962,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
         tp2 = resistance
         tp3 = resistance
 
-    confidence = min(92, max(45, 50 + abs(bullish - bearish) * 7))
+    confidence = min(98, max(45, 50 + abs(bullish - bearish) * 7))
     risk = "Low" if confidence >= 78 else "Medium" if confidence >= 62 else "High"
     mtf_text = "Not available"
     if mtf:
@@ -1924,6 +2073,77 @@ def generate_signal(df: pd.DataFrame, symbol: str, mtf=None, vip=False, lock_fre
     )
 
 
+def generate_vip_chart_image(df: pd.DataFrame, meta: dict):
+    """Create a simple branded VIP chart image with entry, SL and TP zones."""
+    if plt is None or df is None or df.empty:
+        return None
+    try:
+        chart_df = df.tail(80).copy().reset_index(drop=True)
+        x = list(range(len(chart_df)))
+        fig, ax = plt.subplots(figsize=(10, 5.8), dpi=140)
+
+        for i, row in chart_df.iterrows():
+            o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+            ax.plot([i, i], [l, h], linewidth=1)
+            body_low, body_high = min(o, c), max(o, c)
+            ax.add_patch(plt.Rectangle((i - 0.32, body_low), 0.64, max(body_high - body_low, abs(c) * 0.000001), alpha=0.85))
+
+        symbol = meta.get("symbol", "UNKNOWN")
+        direction = meta.get("direction", "")
+        entry_low = float(meta.get("entry_low") or 0)
+        entry_high = float(meta.get("entry_high") or 0)
+        stop = float(meta.get("stop_loss") or 0)
+        tp1 = float(meta.get("tp1") or 0)
+        tp2 = float(meta.get("tp2") or 0)
+        tp3 = float(meta.get("tp3") or 0)
+
+        ax.axhspan(entry_low, entry_high, alpha=0.18)
+        for level, label in [(stop, "SL"), (tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")]:
+            if level:
+                ax.axhline(level, linestyle="--", linewidth=1.2)
+                ax.text(len(chart_df) - 1, level, f" {label} {level:.6g}", va="center", fontsize=8)
+
+        ax.text(0.01, 0.97, "INFLUENCERTECH SIGNALS", transform=ax.transAxes, fontsize=16, fontweight="bold", va="top")
+        ax.text(0.01, 0.90, f"{symbol} | {direction} | Confidence {meta.get('confidence', 0)}%", transform=ax.transAxes, fontsize=10, va="top")
+        ax.text(0.01, 0.84, f"Entry {entry_low:.6g} - {entry_high:.6g}", transform=ax.transAxes, fontsize=9, va="top")
+        ax.set_title(f"{symbol} VIP Setup")
+        ax.set_xlabel("Recent candles")
+        ax.set_ylabel("Price")
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        bio = io.BytesIO()
+        fig.savefig(bio, format="png", bbox_inches="tight")
+        plt.close(fig)
+        bio.seek(0)
+        bio.name = f"{clean_symbol(symbol)}_vip_chart.png"
+        return bio
+    except Exception as e:
+        logger.warning("VIP chart generation failed for %s: %s", meta.get("symbol"), e)
+        return None
+
+
+def fetch_df_for_meta(meta: dict):
+    asset_type = meta.get("asset_type", "crypto")
+    symbol = meta.get("symbol")
+    if asset_type == "crypto":
+        return fetch_crypto_klines(symbol, "15", 150)
+    return fetch_yahoo_klines(symbol, asset_type, "15m", 150)
+
+
+async def send_vip_chart(chat_id: int, context: ContextTypes.DEFAULT_TYPE, meta: dict):
+    try:
+        df = fetch_df_for_meta(meta)
+        image = generate_vip_chart_image(df, meta)
+        if image:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=image,
+                caption=f"📊 {meta.get('symbol')} setup chart\n🔥 INFLUENCERTECH SIGNALS",
+            )
+    except Exception as e:
+        logger.warning("Failed to send VIP chart for %s: %s", meta.get("symbol"), e)
+
+
 async def build_crypto_signal(symbol: str, vip=False):
     df = fetch_crypto_klines(symbol, "15", 150)
     mtf = {}
@@ -1966,7 +2186,38 @@ async def score_symbol(symbol: str, asset_type="crypto"):
 
 
 
-def save_vip_signal(user_id: int, asset_type: str, meta: dict):
+def save_vip_tracking_signal(user_id: int, chat_id: int, asset_type: str, meta: dict):
+    if meta.get("direction") == "WAIT":
+        return
+    tracking = load_json(VIP_TRACKING_FILE, [])
+    entry_mid = (float(meta.get("entry_low") or 0) + float(meta.get("entry_high") or 0)) / 2
+    record = {
+        "signal_id": make_order_id(user_id, meta.get("symbol")),
+        "user_id": str(user_id),
+        "chat_id": str(chat_id or user_id),
+        "symbol": meta.get("symbol"),
+        "asset_type": asset_type,
+        "direction": meta.get("direction"),
+        "entry_low": meta.get("entry_low"),
+        "entry_high": meta.get("entry_high"),
+        "entry_mid": entry_mid,
+        "stop_loss": meta.get("stop_loss"),
+        "tp1": meta.get("tp1"),
+        "tp2": meta.get("tp2"),
+        "tp3": meta.get("tp3"),
+        "confidence": meta.get("confidence"),
+        "status": "RUNNING",
+        "notified": {"entry": False, "tp1": False, "tp2": False, "tp3": False, "sl": False},
+        "created_at": now_utc().isoformat(),
+        "updated_at": now_utc().isoformat(),
+    }
+    tracking.append(record)
+    save_json(VIP_TRACKING_FILE, tracking[-1000:])
+
+
+def save_vip_signal(user_id: int, asset_type: str, meta: dict, chat_id: int = None):
+    if meta.get("direction") != "WAIT":
+        save_vip_tracking_signal(user_id, chat_id or user_id, asset_type, meta)
     if not USE_SUPABASE or meta.get("direction") == "WAIT":
         return
     payload = {
@@ -2052,6 +2303,81 @@ async def update_vip_results(context: ContextTypes.DEFAULT_TYPE = None):
             "profit_percent": profit_percent,
             "updated_at": now_utc().isoformat(),
         })
+
+
+def current_event_for_tracking(row: dict):
+    try:
+        price = get_live_market_price(row.get("symbol"), row.get("asset_type", "crypto"))
+        if not price:
+            df = fetch_for_asset(row.get("symbol"), row.get("asset_type", "crypto"))
+            price = float(df["close"].iloc[-1])
+        direction = row.get("direction", "")
+        entry_low = float(row.get("entry_low"))
+        entry_high = float(row.get("entry_high"))
+        stop = float(row.get("stop_loss"))
+        levels = {"tp1": float(row.get("tp1")), "tp2": float(row.get("tp2")), "tp3": float(row.get("tp3"))}
+        notified = row.setdefault("notified", {})
+
+        if not notified.get("entry") and entry_low <= price <= entry_high:
+            return "entry", price
+        if "BUY" in direction:
+            if not notified.get("sl") and price <= stop:
+                return "sl", price
+            for key in ["tp1", "tp2", "tp3"]:
+                if not notified.get(key) and price >= levels[key]:
+                    return key, price
+        elif "SELL" in direction:
+            if not notified.get("sl") and price >= stop:
+                return "sl", price
+            for key in ["tp1", "tp2", "tp3"]:
+                if not notified.get(key) and price <= levels[key]:
+                    return key, price
+    except Exception as e:
+        logger.warning("Tracking event check failed: %s", e)
+    return None, None
+
+
+def format_tracking_notification(row: dict, event: str, price: float):
+    labels = {
+        "entry": "🎯 ENTRY REACHED",
+        "tp1": "✅ TP1 HIT",
+        "tp2": "✅ TP2 HIT",
+        "tp3": "🏆 TP3 HIT",
+        "sl": "🛑 STOP LOSS HIT",
+    }
+    return (
+        f"{labels.get(event, '📌 VIP UPDATE')}\n\n"
+        f"Symbol: `{row.get('symbol')}`\n"
+        f"Direction: `{row.get('direction')}`\n"
+        f"Current Price: `{price:.6g}`\n\n"
+        "🔥 *INFLUENCERTECH SIGNALS*"
+    )
+
+
+async def track_vip_signal_hits(context: ContextTypes.DEFAULT_TYPE):
+    tracking = load_json(VIP_TRACKING_FILE, [])
+    changed = False
+    for row in tracking:
+        if row.get("status") != "RUNNING":
+            continue
+        event, price = current_event_for_tracking(row)
+        if not event:
+            continue
+        row.setdefault("notified", {})[event] = True
+        row["updated_at"] = now_utc().isoformat()
+        if event in ["tp3", "sl"]:
+            row["status"] = "WIN" if event == "tp3" else "LOSS"
+        changed = True
+        try:
+            await context.bot.send_message(
+                chat_id=int(row.get("chat_id") or row.get("user_id")),
+                text=format_tracking_notification(row, event, price),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Failed sending VIP hit notification: %s", e)
+    if changed:
+        save_json(VIP_TRACKING_FILE, tracking[-1000:])
 
 
 async def send_vip_history(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -2222,6 +2548,7 @@ async def automatic_vip_signal_check(context: ContextTypes.DEFAULT_TYPE):
 
 async def maintenance_check(context: ContextTypes.DEFAULT_TYPE):
     await update_vip_results(context)
+    await track_vip_signal_hits(context)
     await premium_expiry_reminder_check(context)
 
 async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -2235,7 +2562,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         text=(
             "🔎 *Scanning Premium Markets...*\n\n"
             "Checking crypto, forex, metals and stocks to find the best B / A / A+ setups.\n"
-            "Minimum confidence: *79%*."
+            "Minimum confidence: *85%* and 90%+ is marked A+."
         ),
         parse_mode="Markdown",
     )
@@ -2256,7 +2583,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
                 meta["asset_type"] = asset_type
                 meta["grade"] = premium_grade(meta.get("confidence", 0))
 
-                if meta.get("direction") != "WAIT" and meta.get("grade") != "IGNORE":
+                if meta.get("direction") != "WAIT" and int(meta.get("confidence", 0) or 0) >= A_SIGNAL_MIN_CONFIDENCE:
                     candidates.append(meta)
             except Exception as e:
                 logger.warning("Premium scan failed for %s %s: %s", asset_type, symbol, e)
@@ -2293,8 +2620,9 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
                 text=format_premium_signal_from_meta(item),
                 parse_mode="Markdown",
             )
+            await send_vip_chart(chat_id, context, item)
             sent += 1
-            save_vip_signal(user_id, item.get("asset_type", "crypto"), item)
+            save_vip_signal(user_id, item.get("asset_type", "crypto"), item, chat_id=chat_id)
 
             mt5_result = queue_mt5_pending_order(user_id, item.get("asset_type", "crypto"), item)
             if mt5_result.get("queued"):
@@ -2362,7 +2690,8 @@ async def send_analysis(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
 
     await context.bot.send_message(chat_id=chat_id, text=signal, parse_mode="Markdown")
     if premium and meta:
-        save_vip_signal(user_id, asset_type, meta)
+        await send_vip_chart(chat_id, context, meta)
+        save_vip_signal(user_id, asset_type, meta, chat_id=chat_id)
         mt5_result = queue_mt5_pending_order(user_id, asset_type, meta)
         if mt5_result.get("queued"):
             order = mt5_result["order"]
@@ -2471,9 +2800,10 @@ async def mt5link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ *MT5 EA Enabled*\n\n"
         f"EA Code: `{code}`\n"
         f"Lot Size: `{profile.get('lot_size', 0.01)}`\n"
-        f"Max Active Orders: `{MAX_ACTIVE_MT5_ORDERS}`\n\n"
+        f"Max Active Orders: `{mt5_max_trades(update.effective_user.id)}`\n\n"
         "Keep MT5 open and attach the InfluencerTech EA to any chart.\n"
         "Use /setlot 0.01 to change lot size.\n"
+        "Use /setmaxtrades 4 to choose max open/pending trades.\n"
         "Use /mt5off to disable auto orders.",
         parse_mode="Markdown",
     )
@@ -2550,6 +2880,67 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("Send a symbol like BTCUSDT, EURUSD, XAUUSD, AAPL or tap /start for menu.")
+
+
+def fetch_crypto_market_snapshot(limit=8):
+    """Top movers and whale-style volume watch from public exchange tickers."""
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        rows = [x for x in r.json() if str(x.get("symbol", "")).endswith("USDT")]
+    except Exception as e:
+        logger.warning("Binance market snapshot failed: %s", e)
+        rows = []
+    if not rows:
+        return None
+    def pct(x):
+        try: return float(x.get("priceChangePercent", 0) or 0)
+        except Exception: return 0
+    def quote_vol(x):
+        try: return float(x.get("quoteVolume", 0) or 0)
+        except Exception: return 0
+    top_gainers = sorted(rows, key=pct, reverse=True)[:limit]
+    top_losers = sorted(rows, key=pct)[:limit]
+    whale_volume = sorted(rows, key=quote_vol, reverse=True)[:limit]
+    return {"gainers": top_gainers, "losers": top_losers, "whales": whale_volume}
+
+
+def format_market_snapshot(snapshot: dict):
+    if not snapshot:
+        return None
+    def line(row):
+        return f"`{row.get('symbol')}` {float(row.get('priceChangePercent', 0) or 0):+.2f}% | Vol ${float(row.get('quoteVolume', 0) or 0)/1_000_000:.1f}M"
+    gainers = "\n".join(line(x) for x in snapshot.get("gainers", [])[:5])
+    losers = "\n".join(line(x) for x in snapshot.get("losers", [])[:5])
+    whales = "\n".join(line(x) for x in snapshot.get("whales", [])[:5])
+    return (
+        "📊 *CRYPTO MARKET AUTO UPDATE*\n"
+        "🔥 *INFLUENCERTECH SIGNALS* 🔥\n\n"
+        "🚀 *Top Gainers*\n" + gainers + "\n\n"
+        "🔻 *Top Losers*\n" + losers + "\n\n"
+        "🐋 *Whale / Accumulation Watch by Volume*\n" + whales + "\n\n"
+        "⚠️ High volume can mean accumulation, distribution or liquidation pressure. Wait for confirmation."
+    )
+
+
+async def scheduled_market_broadcast(context: ContextTypes.DEFAULT_TYPE):
+    snapshot = fetch_crypto_market_snapshot()
+    text = format_market_snapshot(snapshot)
+    if not text:
+        return
+    stamp = now_utc().strftime("%Y-%m-%d-%H")
+    seen = load_json(MARKET_BROADCAST_FILE, {})
+    if seen.get("last_stamp") == stamp:
+        return
+    seen["last_stamp"] = stamp
+    save_json(MARKET_BROADCAST_FILE, seen)
+    users = load_json(USERS_FILE, [])
+    for user_id in list(dict.fromkeys(users)):
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning("Market broadcast failed for %s: %s", user_id, e)
 
 
 def scan_news():
@@ -2680,6 +3071,37 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast finished. Sent: {sent}. Failed: {failed}.")
 
 
+async def resetvipdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args or context.args[0].upper() != "CONFIRM":
+        await update.message.reply_text("⚠️ This clears VIP history, VIP tracking, MT5 queue and all premium subscriptions. Use: /resetvipdata CONFIRM")
+        return
+
+    save_json(VIP_TRACKING_FILE, [])
+    save_json(MT5_ORDERS_FILE, [])
+    save_json(PREMIUM_FILE, {})
+    save_json(PENDING_FILE, {})
+
+    if USE_SUPABASE:
+        # Mark current rows expired/running history reset without deleting table structure.
+        rows = sb_get(PREMIUM_TABLE, {"select": "user_id", "limit": "5000"}) or []
+        for row in rows:
+            try:
+                sb_patch(PREMIUM_TABLE, {"user_id": f"eq.{row['user_id']}"}, {"expires_at": now_utc().isoformat(), "source": "reset", "updated_at": now_utc().isoformat()})
+            except Exception:
+                pass
+        history = sb_get(VIP_HISTORY_TABLE, {"select": "id", "limit": "5000"}) or []
+        for row in history:
+            try:
+                sb_patch(VIP_HISTORY_TABLE, {"id": f"eq.{row['id']}"}, {"status": "RESET", "updated_at": now_utc().isoformat()})
+            except Exception:
+                pass
+
+    await update.message.reply_text("✅ VIP history, tracking queue, MT5 queue and premium subscriptions reset fresh.")
+
+
 async def adminstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Admin only.")
@@ -2732,6 +3154,7 @@ def main():
     app.add_handler(CommandHandler("viphistory", vip_history_command))
     app.add_handler(CommandHandler("vipperformance", vip_performance_command))
     app.add_handler(CommandHandler("adminstats", adminstats))
+    app.add_handler(CommandHandler("resetvipdata", resetvipdata))
     app.add_handler(CommandHandler("setlot", setlot))
     app.add_handler(CommandHandler("setmaxtrades", setmaxtrades))
     app.add_handler(CommandHandler("mt5link", mt5link))
@@ -2741,6 +3164,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.job_queue.run_repeating(scheduled_news_check, interval=NEWS_CHECK_MINUTES * 60, first=20)
+    app.job_queue.run_repeating(scheduled_market_broadcast, interval=6 * 60 * 60, first=90)
     app.job_queue.run_repeating(maintenance_check, interval=15 * 60, first=60)
 
     print("Bot is running...")

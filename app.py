@@ -76,6 +76,8 @@ button_click = bot_module.button_click
 text_handler = bot_module.text_handler
 scheduled_news_check = bot_module.scheduled_news_check
 maintenance_check = bot_module.maintenance_check
+scheduled_market_broadcast = getattr(bot_module, "scheduled_market_broadcast", None)
+resetvipdata = getattr(bot_module, "resetvipdata", None)
 handle_mpesa_callback = bot_module.handle_mpesa_callback
 
 telegram_app = Application.builder().token(BOT_TOKEN).build()
@@ -90,6 +92,8 @@ telegram_app.add_handler(CommandHandler("givepremium", givepremium))
 telegram_app.add_handler(CommandHandler("viphistory", vip_history_command))
 telegram_app.add_handler(CommandHandler("vipperformance", vip_performance_command))
 telegram_app.add_handler(CommandHandler("adminstats", adminstats))
+if resetvipdata:
+    telegram_app.add_handler(CommandHandler("resetvipdata", resetvipdata))
 
 if setlot:
     telegram_app.add_handler(CommandHandler("setlot", setlot))
@@ -160,6 +164,7 @@ def set_webhook():
             BotCommand("mt5off", "Disable MT5 auto orders"),
             BotCommand("broadcast", "Admin broadcast message"),
             BotCommand("givepremium", "Admin activate premium manually"),
+            BotCommand("resetvipdata", "Admin reset VIP and premium data"),
         ]
         if mt5queue:
             commands.append(BotCommand("mt5queue", "View MT5 queue"))
@@ -191,7 +196,9 @@ def check_news():
         fake_context = type("FakeContext", (), {"bot": telegram_app.bot})()
         loop.run_until_complete(scheduled_news_check(fake_context))
         loop.run_until_complete(maintenance_check(fake_context))
-        return jsonify({"ok": True, "message": "News + VIP maintenance completed"})
+        if scheduled_market_broadcast:
+            loop.run_until_complete(scheduled_market_broadcast(fake_context))
+        return jsonify({"ok": True, "message": "News + market broadcast + VIP maintenance completed"})
     except Exception as e:
         logger.exception("Cron check error")
         return jsonify({"ok": False, "error": str(e)}), 500

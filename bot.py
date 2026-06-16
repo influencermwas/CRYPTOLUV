@@ -867,6 +867,24 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_analysis(query.message.chat_id, query.from_user.id, context, symbol, "crypto", premium=False)
     elif data == "premium":
         await show_premium(query.message.chat_id, query.from_user.id, context)
+    elif data.startswith("payplan_"):
+        plan_id = data.replace("payplan_", "")
+        plan = get_premium_plan(plan_id)
+
+        context.user_data["awaiting_premium_phone"] = True
+        context.user_data["premium_plan"] = plan_id
+
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                f"💎 *{plan['label']} Premium Subscription*\n\n"
+                f"Price: *KSh {plan['price']}*\n"
+                f"Duration: *{plan['hours'] // 24} day(s)*\n\n"
+                "Send your M-Pesa number now.\n"
+                "Example: `0712345678`"
+            ),
+            parse_mode="Markdown",
+        )
     elif data == "referral":
         await send_referral_dashboard(query.message.chat_id, query.from_user.id, context)
     elif data == "vip_signal":
@@ -1058,9 +1076,9 @@ async def handle_premium_phone(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await update.message.reply_text(
             "✅ STK Push sent.\n\n"
-            f"Amount: KSh {PREMIUM_PRICE}\n"
+            f"Amount: KSh {plan['price']}\n"
             f"Phone: {phone}\n\n"
-            "After payment, premium will open automatically for 24 hours."
+            f"After payment, premium will open automatically for {plan['hours'] // 24} day(s)."
         )
         context.user_data["awaiting_premium_phone"] = False
         context.user_data.pop("premium_plan", None)
@@ -1098,7 +1116,7 @@ async def handle_mpesa_callback(data: dict, bot):
             chat_id=user_id,
             text=(
                 "✅ *Payment received!*\n\n"
-                "💎 Premium Signals activated for *24 hours*.\n"
+                f"💎 Premium Signals activated for *{plan['hours'] // 24} day(s)*.\n"
                 f"Expires: `{expires.strftime('%Y-%m-%d %H:%M UTC')}`\n\n"
                 "Tap /start then 💎 Premium Signals."
             ),

@@ -2323,36 +2323,53 @@ async def update_vip_results(context: ContextTypes.DEFAULT_TYPE = None):
         })
 
 
-def current_event_for_tracking(row: dict):
+
+def current_events_for_tracking(row: dict):
+    """Return all new VIP events hit now, so fast moves can notify TP1/TP2/TP3 correctly."""
+    events = []
     try:
         price = get_live_market_price(row.get("symbol"), row.get("asset_type", "crypto"))
         if not price:
             df = fetch_for_asset(row.get("symbol"), row.get("asset_type", "crypto"))
             price = float(df["close"].iloc[-1])
+
         direction = row.get("direction", "")
         entry_low = float(row.get("entry_low"))
         entry_high = float(row.get("entry_high"))
         stop = float(row.get("stop_loss"))
-        levels = {"tp1": float(row.get("tp1")), "tp2": float(row.get("tp2")), "tp3": float(row.get("tp3"))}
+        levels = {
+            "tp1": float(row.get("tp1")),
+            "tp2": float(row.get("tp2")),
+            "tp3": float(row.get("tp3")),
+        }
         notified = row.setdefault("notified", {})
 
         if not notified.get("entry") and entry_low <= price <= entry_high:
-            return "entry", price
+            events.append(("entry", price))
+
         if "BUY" in direction:
             if not notified.get("sl") and price <= stop:
-                return "sl", price
-            for key in ["tp1", "tp2", "tp3"]:
-                if not notified.get(key) and price >= levels[key]:
-                    return key, price
+                events.append(("sl", price))
+            else:
+                for key in ["tp1", "tp2", "tp3"]:
+                    if not notified.get(key) and price >= levels[key]:
+                        events.append((key, price))
         elif "SELL" in direction:
             if not notified.get("sl") and price >= stop:
-                return "sl", price
-            for key in ["tp1", "tp2", "tp3"]:
-                if not notified.get(key) and price <= levels[key]:
-                    return key, price
+                events.append(("sl", price))
+            else:
+                for key in ["tp1", "tp2", "tp3"]:
+                    if not notified.get(key) and price <= levels[key]:
+                        events.append((key, price))
     except Exception as e:
         logger.warning("Tracking event check failed: %s", e)
-    return None, None
+    return events
+
+
+# Backward-compatible wrapper for old code that calls current_event_for_tracking().
+def current_event_for_tracking(row: dict):
+    events = current_events_for_tracking(row)
+    return events[0] if events else (None, None)
 
 
 def format_tracking_notification(row: dict, event: str, price: float):
@@ -2367,6 +2384,11 @@ def format_tracking_notification(row: dict, event: str, price: float):
         f"{labels.get(event, '📌 VIP UPDATE')}\n\n"
         f"Symbol: `{row.get('symbol')}`\n"
         f"Direction: `{row.get('direction')}`\n"
+        f"Entry: `{float(row.get('entry_mid') or 0):.6g}`\n"
+        f"TP1: `{float(row.get('tp1') or 0):.6g}`\n"
+        f"TP2: `{float(row.get('tp2') or 0):.6g}`\n"
+        f"TP3: `{float(row.get('tp3') or 0):.6g}`\n"
+        f"Stop Loss: `{float(row.get('stop_loss') or 0):.6g}`\n"
         f"Current Price: `{price:.6g}`\n\n"
         "🔥 *INFLUENCERTECH SIGNALS*"
     )
@@ -2378,22 +2400,32 @@ async def track_vip_signal_hits(context: ContextTypes.DEFAULT_TYPE):
     for row in tracking:
         if row.get("status") != "RUNNING":
             continue
-        event, price = current_event_for_tracking(row)
-        if not event:
+
+        events = current_events_for_tracking(row)
+        if not events:
             continue
-        row.setdefault("notified", {})[event] = True
-        row["updated_at"] = now_utc().isoformat()
-        if event in ["tp3", "sl"]:
-            row["status"] = "WIN" if event == "tp3" else "LOSS"
-        changed = True
-        try:
-            await context.bot.send_message(
-                chat_id=int(row.get("chat_id") or row.get("user_id")),
-                text=format_tracking_notification(row, event, price),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.warning("Failed sending VIP hit notification: %s", e)
+
+        for event, price in events:
+            if row.setdefault("notified", {}).get(event):
+                continue
+            row["notified"][event] = True
+            row["updated_at"] = now_utc().isoformat()
+            if event in ["tp3", "sl"]:
+                row["status"] = "WIN" if event == "tp3" else "LOSS"
+            changed = True
+            try:
+                await context.bot.send_message(
+                    chat_id=int(row.get("chat_id") or row.get("user_id")),
+                    text=format_tracking_notification(row, event, price),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.warning("Failed sending VIP hit notification: %s", e)
+
+            # If SL or TP3 hit, close tracking after sending that final alert.
+            if event in ["tp3", "sl"]:
+                break
+
     if changed:
         save_json(VIP_TRACKING_FILE, tracking[-1000:])
 
@@ -2569,6 +2601,56 @@ async def maintenance_check(context: ContextTypes.DEFAULT_TYPE):
     await track_vip_signal_hits(context)
     await premium_expiry_reminder_check(context)
 
+
+def active_duplicate_vip_signal(user_id: int, symbol: str, direction: str = None, max_age_hours: int = 72):
+    """Skip sending the same premium setup while an earlier one is still running/recent."""
+    clean = clean_symbol(symbol)
+    since = now_utc() - timedelta(hours=max_age_hours)
+
+    # Local tracking file is used even when Supabase is off.
+    for row in load_json(VIP_TRACKING_FILE, []):
+        try:
+            if str(row.get("user_id")) != str(user_id):
+                continue
+            if clean_symbol(row.get("symbol")) != clean:
+                continue
+            if direction and row.get("direction") != direction:
+                continue
+            created = parse_dt(row.get("created_at")) or now_utc()
+            if row.get("status") == "RUNNING" or created >= since:
+                return True
+        except Exception:
+            continue
+
+    # Supabase history check when configured.
+    if USE_SUPABASE:
+        rows = sb_get(VIP_HISTORY_TABLE, {
+            "user_id": f"eq.{user_id}",
+            "symbol": f"eq.{symbol}",
+            "status": "eq.RUNNING",
+            "select": "symbol,direction,status,created_at",
+            "limit": "10",
+        }) or []
+        for row in rows:
+            if direction and row.get("direction") != direction:
+                continue
+            return True
+
+    return False
+
+
+def unique_preserve_order(items):
+    seen = set()
+    out = []
+    for item in items:
+        key = clean_symbol(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     active, expires = is_premium(user_id)
     if not active:
@@ -2580,18 +2662,26 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         text=(
             "🔎 *Scanning Premium Markets...*\n\n"
             "Checking crypto, forex, metals and stocks to find the best B / A / A+ setups.\n"
-            "Minimum confidence: *85%* and 90%+ is marked A+."
+            f"Minimum confidence: *{PREMIUM_MIN_CONFIDENCE}%*. "
+            f"{A_SIGNAL_MIN_CONFIDENCE}%+ is A, and {A_PLUS_MIN_CONFIDENCE}%+ is A+."
         ),
         parse_mode="Markdown",
     )
 
     candidates = []
     errors = []
+    skipped_duplicates = 0
+
+    # Important: XAU/XAG were previously outside FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT],
+    # so gold could be skipped. Scan metals separately and always include XAU/USD.
+    metal_watchlist = unique_preserve_order(["XAU/USD", "XAG/USD", "XPT/USD", "XPD/USD"])
+    forex_only = [s for s in FOREX_WATCHLIST if clean_symbol(s) not in {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}]
 
     scan_groups = [
-        ("crypto", CRYPTO_WATCHLIST[:PREMIUM_CRYPTO_SCAN_LIMIT]),
-        ("forex", FOREX_WATCHLIST[:PREMIUM_FOREX_SCAN_LIMIT]),
-        ("stock", STOCK_WATCHLIST[:PREMIUM_STOCK_SCAN_LIMIT]),
+        ("metal", metal_watchlist),
+        ("crypto", CRYPTO_WATCHLIST[:max(PREMIUM_CRYPTO_SCAN_LIMIT, PREMIUM_DAILY_LIMIT * 3)]),
+        ("forex", forex_only[:max(PREMIUM_FOREX_SCAN_LIMIT, PREMIUM_DAILY_LIMIT * 3)]),
+        ("stock", STOCK_WATCHLIST[:max(PREMIUM_STOCK_SCAN_LIMIT, PREMIUM_DAILY_LIMIT * 3)]),
     ]
 
     for asset_type, watchlist in scan_groups:
@@ -2601,11 +2691,29 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
                 meta["asset_type"] = asset_type
                 meta["grade"] = premium_grade(meta.get("confidence", 0))
 
-                if meta.get("direction") != "WAIT" and int(meta.get("confidence", 0) or 0) >= A_SIGNAL_MIN_CONFIDENCE:
-                    candidates.append(meta)
+                confidence = int(meta.get("confidence", 0) or 0)
+                direction = meta.get("direction")
+
+                if direction == "WAIT" or confidence < PREMIUM_MIN_CONFIDENCE:
+                    continue
+
+                if active_duplicate_vip_signal(user_id, meta.get("symbol", symbol), direction):
+                    skipped_duplicates += 1
+                    continue
+
+                candidates.append(meta)
             except Exception as e:
                 logger.warning("Premium scan failed for %s %s: %s", asset_type, symbol, e)
                 errors.append(f"{symbol}: {e}")
+
+    # Remove same symbol duplicates inside this scan too.
+    unique = {}
+    for item in candidates:
+        key = (clean_symbol(item.get("symbol")), item.get("direction"))
+        old = unique.get(key)
+        if not old or int(item.get("confidence", 0) or 0) > int(old.get("confidence", 0) or 0):
+            unique[key] = item
+    candidates = list(unique.values())
 
     candidates = sorted(
         candidates,
@@ -2617,15 +2725,18 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⚪ No 79%+ premium setup found right now.\n\n"
-                "The bot scanned crypto, forex, metals and stocks, but no valid B / A / A+ signal passed."
+                f"⚪ No fresh {PREMIUM_MIN_CONFIDENCE}%+ premium setup found right now.\n\n"
+                "I skipped any signal that is already running/recently sent, then scanned crypto, forex, metals and stocks."
             ),
         )
         return
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"💎 Found *{len(candidates)}* premium setup(s). Sending all now...",
+        text=(
+            f"💎 Found *{len(candidates)}* fresh premium setup(s). Sending now...\n"
+            f"♻️ Duplicate running signals skipped: *{skipped_duplicates}*"
+        ),
         parse_mode="Markdown",
     )
 
@@ -2668,7 +2779,7 @@ async def premium_signals(chat_id: int, user_id: int, context: ContextTypes.DEFA
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"✅ Premium scan finished. Sent: {sent}. Failed: {failed}.",
+        text=f"✅ Premium scan finished. Sent: {sent}. Failed: {failed}. Skipped duplicates: {skipped_duplicates}.",
     )
 
 
